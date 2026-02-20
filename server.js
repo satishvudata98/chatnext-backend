@@ -26,24 +26,24 @@ process.on("unhandledRejection", err => {
 
 // HTTP SERVER
 const server = http.createServer(async (req, res) => {
- const origin = req.headers.origin;
+  const origin = req.headers.origin;
 
- if (origin) {
-   res.setHeader("Access-Control-Allow-Origin", origin);
- }
+  if (origin) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  }
 
- res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
- res.setHeader(
-   "Access-Control-Allow-Methods",
-   "GET, POST, PUT, DELETE, OPTIONS",
- );
- res.setHeader("Access-Control-Allow-Credentials", "true");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "GET, POST, PUT, DELETE, OPTIONS",
+  );
+  res.setHeader("Access-Control-Allow-Credentials", "true");
 
- if (req.method === "OPTIONS") {
-   res.writeHead(204);
-   res.end();
-   return;
- }
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
   const protocol = req.headers["x-forwarded-proto"] || "http";
   const host = req.headers.host || "localhost";
 
@@ -56,6 +56,14 @@ const server = http.createServer(async (req, res) => {
   }
 
   const pathname = parsedUrl.pathname;
+
+  // Healthcheck route (required for Railway)
+  if (req.method === "GET" && pathname === "/") {
+    return sendJSON(res, 200, {
+      success: true,
+      message: "ChatNext backend running",
+    });
+  }
 
   // REGISTER
   if (req.method === "POST" && pathname === "/api/auth/register") {
@@ -109,7 +117,6 @@ const server = http.createServer(async (req, res) => {
     req.on("data", (chunk) => (body += chunk));
 
     req.on("end", async () => {
-
       let data;
       try {
         data = JSON.parse(body);
@@ -303,22 +310,6 @@ const server = http.createServer(async (req, res) => {
     if (error) return sendJSON(res, 500, error);
 
     sendJSON(res, 200, { success: true, messages: data });
-
-    return;
-  }
-
-  // STATIC
-  if (req.method === "GET") {
-    try {
-      const filePath = "./public" + (req.url === "/" ? "/index.html" : req.url);
-
-      const data = fs.readFileSync(filePath);
-
-      res.writeHead(200);
-      res.end(data);
-    } catch {
-      sendJSON(res, 404, { success: false });
-    }
 
     return;
   }
