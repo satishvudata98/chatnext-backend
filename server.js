@@ -15,40 +15,46 @@ const JWT_EXPIRY = "7d";
 
 const clients = new Map();
 
-// Allowed origins for CORS
-const ALLOWED_ORIGINS = [
-  "http://localhost:5173",
-  "http://localhost:5174",
-  "http://localhost:3000",
-  process.env.FRONTEND_URL,
-].filter(Boolean);
+
+process.on("uncaughtException", err => {
+  console.error("UNCAUGHT EXCEPTION:", err);
+});
+
+process.on("unhandledRejection", err => {
+  console.error("UNHANDLED REJECTION:", err);
+});
 
 // HTTP SERVER
 const server = http.createServer(async (req, res) => {
-  const origin = req.headers.origin;
-  
-  // Set CORS headers with explicit origin validation
-  if (ALLOWED_ORIGINS.includes(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Access-Control-Allow-Credentials", "true");
-  } else if (!origin) {
-    // For non-browser requests (like testing), allow without credentials
-    res.setHeader("Access-Control-Allow-Origin", "*");
-  }
+ const origin = req.headers.origin;
 
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.setHeader(
-    "Access-Control-Allow-Methods",
-    "GET, POST, PUT, DELETE, OPTIONS",
-  );
+ if (origin) {
+   res.setHeader("Access-Control-Allow-Origin", origin);
+ }
 
-  if (req.method === "OPTIONS") {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
+ res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+ res.setHeader(
+   "Access-Control-Allow-Methods",
+   "GET, POST, PUT, DELETE, OPTIONS",
+ );
+ res.setHeader("Access-Control-Allow-Credentials", "true");
+
+ if (req.method === "OPTIONS") {
+   res.writeHead(204);
+   res.end();
+   return;
+ }
   const protocol = req.headers["x-forwarded-proto"] || "http";
-  const parsedUrl = new url.URL(req.url, `${protocol}://${req.headers.host}`);
+  const host = req.headers.host || "localhost";
+
+  let parsedUrl;
+  try {
+    parsedUrl = new url.URL(req.url, `${protocol}://${host}`);
+  } catch (err) {
+    console.error("URL parse error:", err);
+    return sendJSON(res, 400, { success: false, message: "Invalid URL" });
+  }
+
   const pathname = parsedUrl.pathname;
 
   // REGISTER
@@ -103,7 +109,15 @@ const server = http.createServer(async (req, res) => {
     req.on("data", (chunk) => (body += chunk));
 
     req.on("end", async () => {
-      const { username, password } = JSON.parse(body);
+
+      let data;
+      try {
+        data = JSON.parse(body);
+      } catch {
+        return sendJSON(res, 400, { success: false, message: "Invalid JSON" });
+      }
+
+      const { username, password } = data;
 
       const { data: user, error } = await supabase
         .from("users")
