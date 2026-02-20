@@ -1,0 +1,45 @@
+# dependencies
+node_modules/
+
+# environment variables (VERY IMPORTANT)
+.env
+.env.local
+.env.development
+.env.production
+
+# logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# runtime files
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# coverage directory
+coverage/
+
+# build output
+dist/
+build/
+
+# cache
+.cache/
+.parcel-cache/
+
+# optional: IDE files
+.vscode/
+.idea/
+
+# optional: temp files
+tmp/
+temp/
