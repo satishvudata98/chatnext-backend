@@ -16,7 +16,9 @@ const clients = new Map();
 // HTTP SERVER
 const server = http.createServer(async (req, res) => {
 
-  res.setHeader("Access-Control-Allow-Origin", "*");
+  const origin = req.headers.origin || "*";
+
+  res.setHeader("Access-Control-Allow-Origin", origin);
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader(
     "Access-Control-Allow-Methods",
@@ -25,7 +27,7 @@ const server = http.createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Credentials", "true");
 
   if (req.method === "OPTIONS") {
-    res.writeHead(204);
+    res.statusCode = 204;
     res.end();
     return;
   }
