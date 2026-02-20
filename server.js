@@ -15,17 +15,32 @@ const JWT_EXPIRY = "7d";
 
 const clients = new Map();
 
+// Allowed origins for CORS
+const ALLOWED_ORIGINS = [
+  "http://localhost:5173",
+  "http://localhost:5174",
+  "http://localhost:3000",
+  process.env.FRONTEND_URL,
+].filter(Boolean);
+
 // HTTP SERVER
 const server = http.createServer(async (req, res) => {
   const origin = req.headers.origin;
+  
+  // Set CORS headers with explicit origin validation
+  if (ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+  } else if (!origin) {
+    // For non-browser requests (like testing), allow without credentials
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  }
 
-  res.setHeader("Access-Control-Allow-Origin", origin || "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader(
     "Access-Control-Allow-Methods",
     "GET, POST, PUT, DELETE, OPTIONS",
   );
-  res.setHeader("Access-Control-Allow-Credentials", "true");
 
   if (req.method === "OPTIONS") {
     res.writeHead(204);
