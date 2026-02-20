@@ -295,18 +295,20 @@ const server = http.createServer(async (req, res) => {
 });
 
 // Utility functions
-function sendJSON(res, statusCode, obj) {
-    res.writeHead(statusCode || 200, {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization",
-        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-        "Access-Control-Allow-Credentials": "true"
-    });
+function sendJSON(res, statusCode, obj, origin = "*") {
+  res.statusCode = statusCode || 200;
 
-    res.end(JSON.stringify(obj));
+  res.setHeader("Content-Type", "application/json");
+  res.setHeader("Access-Control-Allow-Origin", origin);
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "GET, POST, PUT, DELETE, OPTIONS",
+  );
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+
+  res.end(JSON.stringify(obj));
 }
-
 function getCurrentTimestamp() {
     return Math.floor(Date.now() / 1000);
 }
