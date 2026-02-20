@@ -17,7 +17,9 @@ const clients = new Map();
 function sendJSON(res, statusCode, obj) {
     res.writeHead(statusCode || 200, {
         "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*"
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS"
     });
     res.end(JSON.stringify(obj));
 }
@@ -45,12 +47,20 @@ function verifyToken(token) {
 const server = http.createServer(async (req, res) => {
 
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      "Content-Type, Authorization",
+    );
+    res.setHeader(
+      "Access-Control-Allow-Methods",
+      "GET, POST, PUT, DELETE, OPTIONS",
+    );
+    res.setHeader("Access-Control-Allow-Credentials", "true");
 
     if (req.method === "OPTIONS") {
-        res.writeHead(200);
-        res.end();
-        return;
+      res.writeHead(204);
+      res.end();
+      return;
     }
 
     const parsedUrl = new url.URL(req.url, `http://${req.headers.host}`);
