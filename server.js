@@ -15,10 +15,9 @@ const clients = new Map();
 
 // HTTP SERVER
 const server = http.createServer(async (req, res) => {
+  const origin = req.headers.origin;
 
-  const origin = req.headers.origin || "*";
-
-  res.setHeader("Access-Control-Allow-Origin", origin);
+  res.setHeader("Access-Control-Allow-Origin", origin || "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader(
     "Access-Control-Allow-Methods",
@@ -27,12 +26,12 @@ const server = http.createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Credentials", "true");
 
   if (req.method === "OPTIONS") {
-    res.statusCode = 204;
+    res.writeHead(204);
     res.end();
     return;
   }
-
-  const parsedUrl = new url.URL(req.url, `http://${req.headers.host}`);
+  const protocol = req.headers["x-forwarded-proto"] || "http";
+  const parsedUrl = new url.URL(req.url, `${protocol}://${req.headers.host}`);
   const pathname = parsedUrl.pathname;
 
   // REGISTER
@@ -295,20 +294,15 @@ const server = http.createServer(async (req, res) => {
 });
 
 // Utility functions
-function sendJSON(res, statusCode, obj, origin = "*") {
-  res.statusCode = statusCode || 200;
+function sendJSON(res, statusCode, obj) {
 
-  res.setHeader("Content-Type", "application/json");
-  res.setHeader("Access-Control-Allow-Origin", origin);
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.setHeader(
-    "Access-Control-Allow-Methods",
-    "GET, POST, PUT, DELETE, OPTIONS",
-  );
-  res.setHeader("Access-Control-Allow-Credentials", "true");
+  res.writeHead(statusCode, {
+    "Content-Type": "application/json"
+  });
 
   res.end(JSON.stringify(obj));
 }
+
 function getCurrentTimestamp() {
     return Math.floor(Date.now() / 1000);
 }
