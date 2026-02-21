@@ -329,6 +329,24 @@ function getCurrentTimestamp() {
     return Math.floor(Date.now() / 1000);
 }
 
+// Get unread count for a user in a conversation (where they are the receiver and message is not seen)
+async function getUnreadCount(userId, conversationId) {
+    // Query messages where 'from_user_id' is NOT the userId (they are the receiver)
+    // and status is not 'seen'
+    const { count, error } = await supabase
+        .from("messages")
+        .select("*", { count: "exact", head: true })
+        .eq("conversation_id", conversationId)
+        .neq("from_user_id", userId)
+        .neq("status", "seen");
+    
+    if (error) {
+        console.error("Error getting unread count:", error);
+        return 0;
+    }
+    return count || 0;
+}
+
 // JWT
 function generateToken(userId, username) {
     return jwt.sign({ userId, username }, JWT_SECRET, {
@@ -392,6 +410,7 @@ wss.on("connection", ws => {
             const messageId = uuidv4();
             const now = getCurrentTimestamp();
 
+            // Insert message with initial status='sent'
             const { error } = await supabase
                 .from("messages")
                 .insert({
@@ -399,12 +418,36 @@ wss.on("connection", ws => {
                     conversation_id: data.conversationId,
                     from_user_id: userId,
                     message: data.message,
-                    created_at: now
+                    created_at: now,
+                    status: "sent"
                 });
 
             if (error) {
                 console.error("Error saving message:", error);
                 return;
+            }
+
+            let messageStatus = "sent";
+            let deliveredAt = null;
+
+            // Check if recipient is online
+            if (clients.has(data.toUserId)) {
+                // Recipient is online, immediately mark as delivered
+                deliveredAt = getCurrentTimestamp();
+                messageStatus = "delivered";
+
+                // Update message status in database
+                const { error: updateError } = await supabase
+                    .from("messages")
+                    .update({
+                        status: "delivered",
+                        delivered_at: deliveredAt
+                    })
+                    .eq("id", messageId);
+
+                if (updateError) {
+                    console.error("Error updating message status:", updateError);
+                }
             }
 
             // Prepare message object to broadcast
@@ -415,17 +458,88 @@ wss.on("connection", ws => {
                 fromUserId: userId,
                 fromUsername: username,
                 message: data.message,
-                createdAt: now
+                createdAt: now,
+                status: messageStatus
             };
 
             // Send to recipient if they're online
             if (clients.has(data.toUserId)) {
                 clients.get(data.toUserId).ws.send(JSON.stringify(messageToSend));
+
+                // Send delivery confirmation to sender
+                ws.send(JSON.stringify({
+                    type: "message_delivered",
+                    messageId: messageId,
+                    conversationId: data.conversationId,
+                    deliveredAt: deliveredAt
+                }));
+
+                // Send unread count update to recipient
+                const unreadCount = await getUnreadCount(data.toUserId, data.conversationId);
+                clients.get(data.toUserId).ws.send(JSON.stringify({
+                    type: "unread_count_update",
+                    conversationId: data.conversationId,
+                    fromUserId: userId,
+                    count: unreadCount
+                }));
+            } else {
+                // Recipient is offline, just send confirmation back to sender
+                ws.send(JSON.stringify(messageToSend));
             }
 
-            // Send confirmation back to sender
-            ws.send(JSON.stringify(messageToSend));
+        }
 
+        if (data.type === "message_seen") {
+            // Handle message seen event - batch update all messages as seen
+            const conversationId = data.conversationId;
+            const messageIds = data.messageIds || [];
+            const now = getCurrentTimestamp();
+
+            if (messageIds.length === 0) {
+                // No specific messages, update all unseen messages in this conversation
+                const { error: updateError } = await supabase
+                    .from("messages")
+                    .update({
+                        status: "seen",
+                        seen_at: now
+                    })
+                    .eq("conversation_id", conversationId)
+                    .neq("from_user_id", userId)
+                    .neq("status", "seen");
+
+                if (updateError) {
+                    console.error("Error updating message seen status:", updateError);
+                    return;
+                }
+            } else {
+                // Update specific messages
+                const { error: updateError } = await supabase
+                    .from("messages")
+                    .update({
+                        status: "seen",
+                        seen_at: now
+                    })
+                    .in("id", messageIds)
+                    .neq("from_user_id", userId);
+
+                if (updateError) {
+                    console.error("Error updating message seen status:", updateError);
+                    return;
+                }
+            }
+
+            // Notify all connected clients about seen status for this conversation
+            wss.clients.forEach(client => {
+                if (client.readyState === 1) { // 1 = OPEN
+                    client.send(JSON.stringify({
+                        type: "message_seen",
+                        conversationId: conversationId,
+                        userId: userId,
+                        seenAt: now,
+                        messageIds: messageIds
+                    }));
+                }
+            });
         }
 
     });
