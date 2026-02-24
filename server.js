@@ -11,7 +11,9 @@ import supabase from "./supabaseClient.js";
 
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET;
-const JWT_EXPIRY = "7d";
+const REFRESH_SECRET = process.env.REFRESH_SECRET || JWT_SECRET; // Use different secret if available
+const ACCESS_EXPIRY = "15m"; // Short-lived access token
+const REFRESH_EXPIRY = "7d"; // Long-lived refresh token
 
 const clients = new Map();
 
@@ -96,11 +98,27 @@ const server = http.createServer(async (req, res) => {
         if (error)
           return sendJSON(res, 400, { success: false, message: error.message });
 
-        const token = generateToken(userId, username);
+        const accessToken = generateAccessToken(userId, username);
+        const refreshToken = generateRefreshToken(userId);
+
+        // Store refresh token in database
+        const refreshExpiry = Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60; // 7 days
+        const { error: refreshError } = await supabase.from("refresh_tokens").insert({
+          user_id: userId,
+          token: refreshToken,
+          expires_at: refreshExpiry,
+          created_at: now,
+        });
+
+        if (refreshError) {
+          console.error("Error storing refresh token:", refreshError);
+          // Continue anyway, as access token is still valid
+        }
 
         sendJSON(res, 201, {
           success: true,
-          token,
+          accessToken,
+          refreshToken,
           user: { id: userId, username, email },
         });
       } catch (err) {
@@ -147,15 +165,176 @@ const server = http.createServer(async (req, res) => {
         .update({ last_seen: getCurrentTimestamp() })
         .eq("id", user.id);
 
-      const token = generateToken(user.id, user.username);
+      const accessToken = generateAccessToken(user.id, user.username);
+      const refreshToken = generateRefreshToken(user.id);
+
+      // Delete old refresh tokens for this user
+      await supabase.from("refresh_tokens").delete().eq("user_id", user.id);
+
+      // Store new refresh token
+      const refreshExpiry = Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60;
+      const { error: refreshError } = await supabase.from("refresh_tokens").insert({
+        user_id: user.id,
+        token: refreshToken,
+        expires_at: refreshExpiry,
+        created_at: getCurrentTimestamp(),
+      });
+
+      if (refreshError) {
+        console.error("Error storing refresh token:", refreshError);
+      }
 
       sendJSON(res, 200, {
         success: true,
-        token,
+        accessToken,
+        refreshToken,
         user,
       });
     });
 
+    return;
+  }
+
+  // REFRESH TOKEN
+  if (req.method === "POST" && pathname === "/api/auth/refresh") {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+
+    req.on("end", async () => {
+      try {
+        const { refreshToken } = JSON.parse(body);
+
+        if (!refreshToken) {
+          return sendJSON(res, 400, { success: false, message: "Refresh token required" });
+        }
+
+        const decoded = verifyRefreshToken(refreshToken);
+        if (!decoded) {
+          return sendJSON(res, 401, { success: false, message: "Invalid refresh token" });
+        }
+
+        // Check if refresh token exists in DB and not expired
+        const { data: tokenData, error } = await supabase
+          .from("refresh_tokens")
+          .select("*")
+          .eq("token", refreshToken)
+          .eq("user_id", decoded.userId)
+          .single();
+
+        if (error || !tokenData || tokenData.expires_at < getCurrentTimestamp()) {
+          return sendJSON(res, 401, { success: false, message: "Refresh token expired or invalid" });
+        }
+
+        // Get user data
+        const { data: user, error: userError } = await supabase
+          .from("users")
+          .select("id, username, email")
+          .eq("id", decoded.userId)
+          .single();
+
+        if (userError || !user) {
+          return sendJSON(res, 401, { success: false, message: "User not found" });
+        }
+
+        // Generate new tokens
+        const newAccessToken = generateAccessToken(user.id, user.username);
+        const newRefreshToken = generateRefreshToken(user.id);
+
+        // Delete old refresh token and store new one
+        await supabase.from("refresh_tokens").delete().eq("token", refreshToken);
+        const refreshExpiry = Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60;
+        await supabase.from("refresh_tokens").insert({
+          user_id: user.id,
+          token: newRefreshToken,
+          expires_at: refreshExpiry,
+          created_at: getCurrentTimestamp(),
+        });
+
+        sendJSON(res, 200, {
+          success: true,
+          accessToken: newAccessToken,
+          refreshToken: newRefreshToken,
+        });
+      } catch (err) {
+        sendJSON(res, 500, { success: false, message: err.message });
+      }
+    });
+
+    return;
+  }
+
+  // VERIFY TOKEN
+  if (req.method === "GET" && pathname === "/api/auth/verify") {
+    const token = req.headers.authorization?.split(" ")[1];
+    const decoded = verifyAccessToken(token);
+
+    if (!decoded) {
+      return sendJSON(res, 401, { success: false, message: "Invalid token" });
+    }
+
+    // Get user data
+    const { data: user, error } = await supabase
+      .from("users")
+      .select("id, username, email")
+      .eq("id", decoded.userId)
+      .single();
+
+    if (error || !user) {
+      return sendJSON(res, 401, { success: false, message: "User not found" });
+    }
+
+    sendJSON(res, 200, { success: true, user });
+    return;
+  }
+
+  // UPDATE PUBLIC KEY
+  if (req.method === "POST" && pathname === "/api/user/public-key") {
+    const token = req.headers.authorization?.split(" ")[1];
+    const decoded = verifyAccessToken(token);
+
+    if (!decoded) return sendJSON(res, 401, { success: false });
+
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+
+    req.on("end", async () => {
+      try {
+        const { publicKey } = JSON.parse(body);
+
+        const { error } = await supabase
+          .from("users")
+          .update({ public_key: publicKey })
+          .eq("id", decoded.userId);
+
+        if (error) return sendJSON(res, 500, { success: false, message: error.message });
+
+        sendJSON(res, 200, { success: true });
+      } catch (err) {
+        sendJSON(res, 500, { success: false, message: err.message });
+      }
+    });
+
+    return;
+  }
+
+  // GET USER PUBLIC KEY
+  if (req.method === "GET" && pathname === "/api/user/public-key") {
+    const token = req.headers.authorization?.split(" ")[1];
+    const decoded = verifyAccessToken(token);
+
+    if (!decoded) return sendJSON(res, 401, { success: false });
+
+    const userId = parsedUrl.searchParams.get("userId");
+
+    const { data: user, error } = await supabase
+      .from("users")
+      .select("public_key")
+      .eq("id", userId)
+      .single();
+
+    if (error || !user) return sendJSON(res, 404, { success: false, message: "User not found" });
+
+    sendJSON(res, 200, { success: true, publicKey: user.public_key });
     return;
   }
 
@@ -168,7 +347,7 @@ const server = http.createServer(async (req, res) => {
 
     const { data, error } = await supabase
       .from("users")
-      .select("id, username, email, last_seen")
+      .select("id, username, email, last_seen, public_key")
       .neq("id", decoded.userId)
       .order("username");
 
@@ -299,7 +478,7 @@ const server = http.createServer(async (req, res) => {
                 id,
                 conversation_id,
                 from_user_id,
-                message,
+                encrypted_message,
                 created_at,
                 users(username)
             `,
@@ -348,18 +527,45 @@ async function getUnreadCount(userId, conversationId) {
 }
 
 // JWT
-function generateToken(userId, username) {
-    return jwt.sign({ userId, username }, JWT_SECRET, {
-        expiresIn: JWT_EXPIRY
+function generateAccessToken(userId, username) {
+    return jwt.sign({ userId, username, type: 'access' }, JWT_SECRET, {
+        expiresIn: ACCESS_EXPIRY
     });
 }
 
-function verifyToken(token) {
+function generateRefreshToken(userId) {
+    return jwt.sign({ userId, type: 'refresh', jti: uuidv4() }, REFRESH_SECRET, {
+        expiresIn: REFRESH_EXPIRY
+    });
+}
+
+function verifyAccessToken(token) {
     try {
-        return jwt.verify(token, JWT_SECRET);
+        const decoded = jwt.verify(token, JWT_SECRET);
+        if (decoded.type !== 'access') return null;
+        return decoded;
     } catch {
         return null;
     }
+}
+
+function verifyRefreshToken(token) {
+    try {
+        const decoded = jwt.verify(token, REFRESH_SECRET);
+        if (decoded.type !== 'refresh') return null;
+        return decoded;
+    } catch {
+        return null;
+    }
+}
+
+// For backward compatibility, keep generateToken as access token
+function generateToken(userId, username) {
+    return generateAccessToken(userId, username);
+}
+
+function verifyToken(token) {
+    return verifyAccessToken(token);
 }
 
 
@@ -410,14 +616,14 @@ wss.on("connection", ws => {
             const messageId = uuidv4();
             const now = getCurrentTimestamp();
 
-            // Insert message with initial status='sent'
+            // Insert message with encrypted content
             const { error } = await supabase
                 .from("messages")
                 .insert({
                     id: messageId,
                     conversation_id: data.conversationId,
                     from_user_id: userId,
-                    message: data.message,
+                    encrypted_message: JSON.stringify(data.encryptedMessage), // Store encrypted data as JSON
                     created_at: now,
                     status: "sent"
                 });
@@ -457,7 +663,7 @@ wss.on("connection", ws => {
                 conversationId: data.conversationId,
                 fromUserId: userId,
                 fromUsername: username,
-                message: data.message,
+                encryptedMessage: data.encryptedMessage, // Send encrypted data
                 createdAt: now,
                 status: messageStatus
             };
