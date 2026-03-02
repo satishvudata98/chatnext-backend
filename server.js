@@ -14,6 +14,9 @@ import {
 
 const PORT = process.env.PORT || 3000;
 const clients = new Map();
+const MEDIA_BUCKET = process.env.SUPABASE_MEDIA_BUCKET || "chat-media";
+const MAX_MEDIA_SIZE_BYTES = 10 * 1024 * 1024;
+const ALLOWED_MEDIA_TYPES = new Set(["image/jpeg", "image/jpg", "image/png"]);
 
 process.on("uncaughtException", (err) => {
   console.error("UNCAUGHT EXCEPTION:", err);
@@ -292,6 +295,139 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === "POST" && pathname === "/api/media/upload") {
+    const authContext = await requireAuthContext(req, res);
+    if (!authContext) return;
+
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+      if (body.length > MAX_MEDIA_SIZE_BYTES * 2) {
+        req.destroy();
+      }
+    });
+
+    req.on("end", async () => {
+      try {
+        const {
+          conversationId,
+          fileName,
+          mimeType,
+          encryptedData,
+          byteSize,
+        } = JSON.parse(body);
+
+        if (!conversationId || !fileName || !mimeType || !encryptedData) {
+          return sendJSON(res, 400, { success: false, message: "Missing media upload fields" });
+        }
+
+        if (!ALLOWED_MEDIA_TYPES.has(mimeType)) {
+          return sendJSON(res, 400, { success: false, message: "Unsupported image type" });
+        }
+
+        const isMember = await isUserConversationMember(authContext.internalUser.id, conversationId);
+        if (!isMember) {
+          return sendJSON(res, 403, { success: false, message: "Not a member of this conversation" });
+        }
+
+        const encryptedBuffer = Buffer.from(encryptedData, "base64");
+        const bufferSize = encryptedBuffer.byteLength;
+
+        if (!bufferSize || Number.isNaN(bufferSize)) {
+          return sendJSON(res, 400, { success: false, message: "Invalid encrypted image data" });
+        }
+
+        if (bufferSize > MAX_MEDIA_SIZE_BYTES) {
+          return sendJSON(res, 413, { success: false, message: "Image exceeds size limit" });
+        }
+
+        const mediaId = uuidv4();
+        const storagePath = `${conversationId}/${mediaId}.bin`;
+
+        const { error: uploadError } = await supabase.storage
+          .from(MEDIA_BUCKET)
+          .upload(storagePath, encryptedBuffer, {
+            upsert: false,
+            contentType: "application/octet-stream",
+          });
+
+        if (uploadError) {
+          console.error("Media upload failed:", uploadError);
+          return sendJSON(res, 500, { success: false, message: "Failed to upload encrypted image" });
+        }
+
+        const { error: insertError } = await supabase
+          .from("media_files")
+          .insert({
+            id: mediaId,
+            conversation_id: conversationId,
+            uploader_user_id: authContext.internalUser.id,
+            storage_path: storagePath,
+            byte_size: byteSize || bufferSize,
+            created_at: getCurrentTimestamp(),
+          });
+
+        if (insertError) {
+          console.error("Media metadata insert failed:", insertError);
+          await supabase.storage.from(MEDIA_BUCKET).remove([storagePath]);
+          return sendJSON(res, 500, { success: false, message: "Failed to save image metadata" });
+        }
+
+        sendJSON(res, 201, { success: true, mediaId });
+      } catch (error) {
+        console.error("Media upload parse/processing error:", error);
+        sendJSON(res, 400, { success: false, message: "Invalid media upload request" });
+      }
+    });
+    return;
+  }
+
+  if (req.method === "GET" && pathname === "/api/media/download-url") {
+    const authContext = await requireAuthContext(req, res);
+    if (!authContext) return;
+
+    try {
+      const mediaId = parsedUrl.searchParams.get("mediaId");
+      if (!mediaId) {
+        return sendJSON(res, 400, { success: false, message: "Missing mediaId" });
+      }
+
+      const { data: mediaFile, error: mediaError } = await supabase
+        .from("media_files")
+        .select("id, conversation_id, storage_path")
+        .eq("id", mediaId)
+        .single();
+
+      if (mediaError || !mediaFile) {
+        return sendJSON(res, 404, { success: false, message: "Image not found" });
+      }
+
+      const isMember = await isUserConversationMember(
+        authContext.internalUser.id,
+        mediaFile.conversation_id,
+      );
+
+      if (!isMember) {
+        return sendJSON(res, 403, { success: false, message: "Not allowed to access this image" });
+      }
+
+      const { data: signedData, error: signedError } = await supabase.storage
+        .from(MEDIA_BUCKET)
+        .createSignedUrl(mediaFile.storage_path, 60);
+
+      if (signedError || !signedData?.signedUrl) {
+        console.error("Create signed download URL failed:", signedError);
+        return sendJSON(res, 500, { success: false, message: "Failed to generate image URL" });
+      }
+
+      sendJSON(res, 200, { success: true, url: signedData.signedUrl });
+    } catch (error) {
+      console.error("Media download URL error:", error);
+      sendJSON(res, 500, { success: false, message: "Failed to access encrypted image" });
+    }
+    return;
+  }
+
   if (req.method === "GET" && pathname === "/api/users") {
     const authContext = await requireAuthContext(req, res);
     if (!authContext) return;
@@ -441,6 +577,21 @@ function sendJSON(res, statusCode, obj) {
 
 function getCurrentTimestamp() {
   return Math.floor(Date.now() / 1000);
+}
+
+async function isUserConversationMember(userId, conversationId) {
+  const { data, error } = await supabase
+    .from("conversation_members")
+    .select("conversation_id")
+    .eq("conversation_id", conversationId)
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (error && !isNoRowsError(error)) {
+    throw new Error(error.message);
+  }
+
+  return Boolean(data);
 }
 
 function isNoRowsError(error) {
