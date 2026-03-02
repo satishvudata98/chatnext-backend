@@ -17,6 +17,11 @@ const clients = new Map();
 const MEDIA_BUCKET = process.env.SUPABASE_MEDIA_BUCKET || "chat-media";
 const MAX_MEDIA_SIZE_BYTES = 10 * 1024 * 1024;
 const ALLOWED_MEDIA_TYPES = new Set(["image/jpeg", "image/jpg", "image/png"]);
+const BUDDY_REQUEST_STATUS = {
+  PENDING: "PENDING",
+  ACCEPTED: "ACCEPTED",
+  REJECTED: "REJECTED",
+};
 
 process.on("uncaughtException", (err) => {
   console.error("UNCAUGHT EXCEPTION:", err);
@@ -125,6 +130,14 @@ const server = http.createServer(async (req, res) => {
     if (!authContext) return;
 
     const userId = parsedUrl.searchParams.get("userId");
+    if (!userId) {
+      return sendJSON(res, 400, { success: false, message: "Missing userId" });
+    }
+
+    const canAccessPublicKey = await areUsersConfirmedBuddies(authContext.internalUser.id, userId);
+    if (!canAccessPublicKey) {
+      return sendJSON(res, 403, { success: false, message: "Public key is available for buddies only" });
+    }
 
     const { data: user, error } = await supabase
       .from("users")
@@ -325,9 +338,9 @@ const server = http.createServer(async (req, res) => {
           return sendJSON(res, 400, { success: false, message: "Unsupported image type" });
         }
 
-        const isMember = await isUserConversationMember(authContext.internalUser.id, conversationId);
-        if (!isMember) {
-          return sendJSON(res, 403, { success: false, message: "Not a member of this conversation" });
+        const access = await validateConversationAccess(authContext.internalUser.id, conversationId);
+        if (!access.allowed) {
+          return sendJSON(res, 403, { success: false, message: access.reason });
         }
 
         const encryptedBuffer = Buffer.from(encryptedData, "base64");
@@ -402,12 +415,12 @@ const server = http.createServer(async (req, res) => {
         return sendJSON(res, 404, { success: false, message: "Image not found" });
       }
 
-      const isMember = await isUserConversationMember(
+      const access = await validateConversationAccess(
         authContext.internalUser.id,
         mediaFile.conversation_id,
       );
 
-      if (!isMember) {
+      if (!access.allowed) {
         return sendJSON(res, 403, { success: false, message: "Not allowed to access this image" });
       }
 
@@ -432,20 +445,299 @@ const server = http.createServer(async (req, res) => {
     const authContext = await requireAuthContext(req, res);
     if (!authContext) return;
 
+    const buddyIds = await getConfirmedBuddyIds(authContext.internalUser.id);
+    if (buddyIds.length === 0) {
+      sendJSON(res, 200, { success: true, users: [] });
+      return;
+    }
+
     const { data, error } = await supabase
       .from("users")
       .select("id, username, email, last_seen, public_key")
-      .neq("id", authContext.internalUser.id)
+      .in("id", buddyIds)
       .order("username");
 
-    if (error) return sendJSON(res, 500, error);
+    if (error) {
+      return sendJSON(res, 500, {
+        success: false,
+        message: error.message,
+      });
+    }
 
-    const users = data.map((u) => ({
+    const users = (data || []).map((u) => ({
       ...u,
       online: clients.has(u.id),
     }));
 
     sendJSON(res, 200, { success: true, users });
+    return;
+  }
+
+  if (req.method === "GET" && pathname === "/api/users/search") {
+    const authContext = await requireAuthContext(req, res);
+    if (!authContext) return;
+
+    const query = (parsedUrl.searchParams.get("username") || "").trim();
+    if (!query) {
+      return sendJSON(res, 200, { success: true, users: [] });
+    }
+
+    const excludedUserIds = await getExcludedSearchUserIds(authContext.internalUser.id);
+
+    const { data, error } = await supabase
+      .from("users")
+      .select("id, username, email, last_seen")
+      .ilike("username", `%${query}%`)
+      .neq("id", authContext.internalUser.id)
+      .order("username")
+      .limit(20);
+
+    if (error) {
+      return sendJSON(res, 500, {
+        success: false,
+        message: error.message,
+      });
+    }
+
+    const users = (data || [])
+      .filter((candidate) => !excludedUserIds.has(candidate.id))
+      .map((candidate) => ({
+        ...candidate,
+        online: clients.has(candidate.id),
+      }));
+
+    sendJSON(res, 200, { success: true, users });
+    return;
+  }
+
+  if (req.method === "GET" && pathname === "/api/buddy-requests") {
+    const authContext = await requireAuthContext(req, res);
+    if (!authContext) return;
+
+    const { data: requests, error: requestsError } = await supabase
+      .from("buddy_requests")
+      .select("id, requester_id, receiver_id, status, created_at")
+      .eq("receiver_id", authContext.internalUser.id)
+      .eq("status", BUDDY_REQUEST_STATUS.PENDING)
+      .order("created_at", { ascending: false });
+
+    if (requestsError) {
+      return sendJSON(res, 500, {
+        success: false,
+        message: requestsError.message,
+      });
+    }
+
+    const requesterIds = [...new Set((requests || []).map((request) => request.requester_id))];
+    let usersById = new Map();
+
+    if (requesterIds.length > 0) {
+      const { data: requesterUsers, error: usersError } = await supabase
+        .from("users")
+        .select("id, username, email")
+        .in("id", requesterIds);
+
+      if (usersError) {
+        return sendJSON(res, 500, {
+          success: false,
+          message: usersError.message,
+        });
+      }
+
+      usersById = new Map((requesterUsers || []).map((requester) => [requester.id, requester]));
+    }
+
+    const incomingRequests = (requests || [])
+      .map((request) => ({
+        id: request.id,
+        requester_id: request.requester_id,
+        receiver_id: request.receiver_id,
+        status: request.status,
+        created_at: request.created_at,
+        requester: usersById.get(request.requester_id) || null,
+      }))
+      .filter((request) => request.requester);
+
+    sendJSON(res, 200, {
+      success: true,
+      incomingRequests,
+    });
+    return;
+  }
+
+  if (req.method === "POST" && pathname === "/api/buddy-requests") {
+    const authContext = await requireAuthContext(req, res);
+    if (!authContext) return;
+
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
+
+    req.on("end", async () => {
+      try {
+        const { toUserId } = JSON.parse(body);
+
+        if (!toUserId) {
+          return sendJSON(res, 400, { success: false, message: "Missing toUserId" });
+        }
+
+        if (toUserId === authContext.internalUser.id) {
+          return sendJSON(res, 400, { success: false, message: "Cannot add yourself as buddy" });
+        }
+
+        const { data: targetUser, error: targetUserError } = await supabase
+          .from("users")
+          .select("id, username")
+          .eq("id", toUserId)
+          .maybeSingle();
+
+        if (targetUserError || !targetUser) {
+          return sendJSON(res, 404, { success: false, message: "User not found" });
+        }
+
+        const { data: existing, error: existingError } = await supabase
+          .from("buddy_requests")
+          .select("id, status")
+          .or(
+            `and(requester_id.eq.${authContext.internalUser.id},receiver_id.eq.${toUserId}),and(requester_id.eq.${toUserId},receiver_id.eq.${authContext.internalUser.id})`,
+          )
+          .in("status", [BUDDY_REQUEST_STATUS.PENDING, BUDDY_REQUEST_STATUS.ACCEPTED])
+          .limit(1);
+
+        if (existingError) {
+          return sendJSON(res, 500, { success: false, message: existingError.message });
+        }
+
+        if (existing && existing.length > 0) {
+          return sendJSON(res, 409, {
+            success: false,
+            message: "Buddy request already exists or users are already buddies",
+          });
+        }
+
+        const now = getCurrentTimestamp();
+        const requestId = uuidv4();
+        const insertPayload = {
+          id: requestId,
+          requester_id: authContext.internalUser.id,
+          receiver_id: toUserId,
+          status: BUDDY_REQUEST_STATUS.PENDING,
+          created_at: now,
+          updated_at: now,
+        };
+
+        const { error: insertError } = await supabase.from("buddy_requests").insert(insertPayload);
+        if (insertError) {
+          return sendJSON(res, 500, { success: false, message: insertError.message });
+        }
+
+        const targetClient = clients.get(toUserId);
+        if (targetClient?.ws?.readyState === 1) {
+          targetClient.ws.send(
+            JSON.stringify({
+              type: "buddy_request_incoming",
+              request: {
+                id: requestId,
+                requester_id: authContext.internalUser.id,
+                receiver_id: toUserId,
+                status: BUDDY_REQUEST_STATUS.PENDING,
+                created_at: now,
+                requester: {
+                  id: authContext.internalUser.id,
+                  username: authContext.internalUser.username,
+                  email: authContext.internalUser.email,
+                },
+              },
+            }),
+          );
+        }
+
+        sendJSON(res, 201, { success: true });
+      } catch (error) {
+        console.error("Buddy request create failed:", error);
+        sendJSON(res, 400, { success: false, message: "Invalid request payload" });
+      }
+    });
+    return;
+  }
+
+  if (req.method === "POST" && pathname === "/api/buddy-requests/respond") {
+    const authContext = await requireAuthContext(req, res);
+    if (!authContext) return;
+
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
+
+    req.on("end", async () => {
+      try {
+        const { requestId, action } = JSON.parse(body);
+        if (!requestId || !action) {
+          return sendJSON(res, 400, { success: false, message: "Missing requestId or action" });
+        }
+
+        if (action !== "accept" && action !== "reject") {
+          return sendJSON(res, 400, { success: false, message: "Invalid action" });
+        }
+
+        const { data: request, error: requestError } = await supabase
+          .from("buddy_requests")
+          .select("id, requester_id, receiver_id, status")
+          .eq("id", requestId)
+          .maybeSingle();
+
+        if (requestError || !request) {
+          return sendJSON(res, 404, { success: false, message: "Buddy request not found" });
+        }
+
+        if (request.receiver_id !== authContext.internalUser.id) {
+          return sendJSON(res, 403, { success: false, message: "Not allowed to respond to this request" });
+        }
+
+        if (request.status !== BUDDY_REQUEST_STATUS.PENDING) {
+          return sendJSON(res, 409, { success: false, message: "Buddy request already processed" });
+        }
+
+        const now = getCurrentTimestamp();
+        const nextStatus = action === "accept" ? BUDDY_REQUEST_STATUS.ACCEPTED : BUDDY_REQUEST_STATUS.REJECTED;
+        const { error: updateError } = await supabase
+          .from("buddy_requests")
+          .update({
+            status: nextStatus,
+            responded_at: now,
+            updated_at: now,
+          })
+          .eq("id", request.id);
+
+        if (updateError) {
+          return sendJSON(res, 500, { success: false, message: updateError.message });
+        }
+
+        const requesterClient = clients.get(request.requester_id);
+        if (requesterClient?.ws?.readyState === 1) {
+          requesterClient.ws.send(
+            JSON.stringify({
+              type: "buddy_request_updated",
+              requestId: request.id,
+              status: nextStatus,
+              fromUserId: authContext.internalUser.id,
+            }),
+          );
+        }
+
+        if (action === "accept") {
+          await notifyBuddyStatus(authContext.internalUser.id, true);
+          await notifyBuddyStatus(request.requester_id, Boolean(clients.has(request.requester_id)));
+        }
+
+        sendJSON(res, 200, { success: true, status: nextStatus });
+      } catch (error) {
+        console.error("Buddy request respond failed:", error);
+        sendJSON(res, 400, { success: false, message: "Invalid request payload" });
+      }
+    });
     return;
   }
 
@@ -462,10 +754,25 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    const { data: existingConversations, error: searchError } = await supabase
+    if (otherUserId === authContext.internalUser.id) {
+      return sendJSON(res, 400, {
+        success: false,
+        message: "Cannot create conversation with yourself",
+      });
+    }
+
+    const canChat = await areUsersConfirmedBuddies(authContext.internalUser.id, otherUserId);
+    if (!canChat) {
+      return sendJSON(res, 403, {
+        success: false,
+        message: "You can only chat with confirmed buddies",
+      });
+    }
+
+    const { data: sharedMemberships, error: searchError } = await supabase
       .from("conversation_members")
-      .select("conversation_id")
-      .eq("user_id", authContext.internalUser.id);
+      .select("conversation_id, user_id")
+      .in("user_id", [authContext.internalUser.id, otherUserId]);
 
     if (searchError) {
       return sendJSON(res, 500, {
@@ -474,20 +781,23 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    let conversationId = null;
-    if (existingConversations && existingConversations.length > 0) {
-      for (const conv of existingConversations) {
-        const { data: memberCheck } = await supabase
-          .from("conversation_members")
-          .select("conversation_id")
-          .eq("conversation_id", conv.conversation_id)
-          .eq("user_id", otherUserId)
-          .single();
+    const membershipCountByConversation = new Map();
+    for (const member of sharedMemberships || []) {
+      if (!membershipCountByConversation.has(member.conversation_id)) {
+        membershipCountByConversation.set(member.conversation_id, new Set());
+      }
+      membershipCountByConversation.get(member.conversation_id).add(member.user_id);
+    }
 
-        if (memberCheck) {
-          conversationId = conv.conversation_id;
-          break;
-        }
+    let conversationId = null;
+    for (const [candidateConversationId, memberUserIds] of membershipCountByConversation.entries()) {
+      if (
+        memberUserIds.has(authContext.internalUser.id)
+        && memberUserIds.has(otherUserId)
+        && memberUserIds.size === 2
+      ) {
+        conversationId = candidateConversationId;
+        break;
       }
     }
 
@@ -543,6 +853,14 @@ const server = http.createServer(async (req, res) => {
     if (!authContext) return;
 
     const conversationId = parsedUrl.searchParams.get("conversationId");
+    if (!conversationId) {
+      return sendJSON(res, 400, { success: false, message: "Missing conversationId" });
+    }
+
+    const access = await validateConversationAccess(authContext.internalUser.id, conversationId);
+    if (!access.allowed) {
+      return sendJSON(res, 403, { success: false, message: access.reason });
+    }
 
     const { data, error } = await supabase
       .from("messages")
@@ -559,9 +877,11 @@ const server = http.createServer(async (req, res) => {
       .eq("conversation_id", conversationId)
       .order("created_at");
 
-    if (error) return sendJSON(res, 500, error);
+    if (error) {
+      return sendJSON(res, 500, { success: false, message: error.message });
+    }
 
-    sendJSON(res, 200, { success: true, messages: data });
+    sendJSON(res, 200, { success: true, messages: data || [] });
     return;
   }
 
@@ -588,10 +908,134 @@ async function isUserConversationMember(userId, conversationId) {
     .maybeSingle();
 
   if (error && !isNoRowsError(error)) {
-    throw new Error(error.message);
+    console.error("Failed to verify conversation membership:", error);
+    return false;
   }
 
   return Boolean(data);
+}
+
+async function getConversationParticipants(conversationId) {
+  const { data, error } = await supabase
+    .from("conversation_members")
+    .select("user_id")
+    .eq("conversation_id", conversationId);
+
+  if (error) {
+    console.error("Failed to load conversation participants:", error);
+    return [];
+  }
+
+  return (data || []).map((member) => member.user_id);
+}
+
+async function areUsersConfirmedBuddies(userAId, userBId) {
+  if (!userAId || !userBId || userAId === userBId) return false;
+
+  const { data, error } = await supabase
+    .from("buddy_requests")
+    .select("id")
+    .or(
+      `and(requester_id.eq.${userAId},receiver_id.eq.${userBId}),and(requester_id.eq.${userBId},receiver_id.eq.${userAId})`,
+    )
+    .eq("status", BUDDY_REQUEST_STATUS.ACCEPTED)
+    .limit(1);
+
+  if (error) {
+    console.error("Failed to validate buddy relation:", error);
+    return false;
+  }
+
+  return Boolean(data && data.length > 0);
+}
+
+async function getConfirmedBuddyIds(userId) {
+  const { data, error } = await supabase
+    .from("buddy_requests")
+    .select("requester_id, receiver_id")
+    .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`)
+    .eq("status", BUDDY_REQUEST_STATUS.ACCEPTED);
+
+  if (error) {
+    console.error("Failed to load confirmed buddies:", error);
+    return [];
+  }
+
+  const buddyIds = new Set();
+  for (const row of data || []) {
+    if (row.requester_id === userId) {
+      buddyIds.add(row.receiver_id);
+    } else if (row.receiver_id === userId) {
+      buddyIds.add(row.requester_id);
+    }
+  }
+
+  return [...buddyIds];
+}
+
+async function getExcludedSearchUserIds(userId) {
+  const excluded = new Set([userId]);
+
+  const { data, error } = await supabase
+    .from("buddy_requests")
+    .select("requester_id, receiver_id, status")
+    .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`)
+    .in("status", [BUDDY_REQUEST_STATUS.PENDING, BUDDY_REQUEST_STATUS.ACCEPTED]);
+
+  if (error) {
+    console.error("Failed to compute search exclusions:", error);
+    return excluded;
+  }
+
+  for (const row of data || []) {
+    if (row.requester_id === userId) {
+      excluded.add(row.receiver_id);
+    } else if (row.receiver_id === userId) {
+      excluded.add(row.requester_id);
+    }
+  }
+
+  return excluded;
+}
+
+async function validateConversationAccess(userId, conversationId) {
+  const isMember = await isUserConversationMember(userId, conversationId);
+  if (!isMember) {
+    return { allowed: false, reason: "Not a member of this conversation" };
+  }
+
+  const participants = await getConversationParticipants(conversationId);
+  if (participants.length !== 2) {
+    return { allowed: false, reason: "Invalid direct conversation" };
+  }
+
+  const otherUserId = participants.find((participantId) => participantId !== userId);
+  if (!otherUserId) {
+    return { allowed: false, reason: "Invalid conversation membership" };
+  }
+
+  const areBuddies = await areUsersConfirmedBuddies(userId, otherUserId);
+  if (!areBuddies) {
+    return { allowed: false, reason: "Conversation is not between confirmed buddies" };
+  }
+
+  return { allowed: true, otherUserId };
+}
+
+async function notifyBuddyStatus(userId, online) {
+  const buddyIds = await getConfirmedBuddyIds(userId);
+  for (const buddyId of buddyIds) {
+    const buddyClient = clients.get(buddyId);
+    if (buddyClient?.ws?.readyState === 1) {
+      buddyClient.ws.send(
+        JSON.stringify({
+          type: "user_status",
+          userId,
+          online,
+        }),
+      );
+    }
+  }
 }
 
 function isNoRowsError(error) {
@@ -799,7 +1243,13 @@ wss.on("connection", (ws) => {
   let username;
 
   ws.on("message", async (msg) => {
-    const data = JSON.parse(msg);
+    let data;
+    try {
+      data = JSON.parse(msg);
+    } catch {
+      ws.send(JSON.stringify({ type: "error", message: "Invalid websocket payload" }));
+      return;
+    }
 
     if (data.type === "connect") {
       try {
@@ -818,17 +1268,7 @@ wss.on("connection", (ws) => {
           }),
         );
 
-        wss.clients.forEach((client) => {
-          if (client.readyState === 1) {
-            client.send(
-              JSON.stringify({
-                type: "user_status",
-                userId,
-                online: true,
-              }),
-            );
-          }
-        });
+        await notifyBuddyStatus(userId, true);
       } catch {
         ws.close();
       }
@@ -842,129 +1282,178 @@ wss.on("connection", (ws) => {
     }
 
     if (data.type === "message") {
-      const messageId = uuidv4();
-      const now = getCurrentTimestamp();
-
-      const { error } = await supabase.from("messages").insert({
-        id: messageId,
-        conversation_id: data.conversationId,
-        from_user_id: userId,
-        encrypted_message: JSON.stringify(data.encryptedMessage),
-        created_at: now,
-        status: "sent",
-      });
-
-      if (error) {
-        console.error("Error saving message:", error);
-        return;
-      }
-
-      let messageStatus = "sent";
-      let deliveredAt = null;
-
-      if (clients.has(data.toUserId)) {
-        deliveredAt = getCurrentTimestamp();
-        messageStatus = "delivered";
-
-        const { error: updateError } = await supabase
-          .from("messages")
-          .update({
-            status: "delivered",
-            delivered_at: deliveredAt,
-          })
-          .eq("id", messageId);
-
-        if (updateError) {
-          console.error("Error updating message status:", updateError);
+      try {
+        if (!data?.conversationId || !data?.toUserId || !data?.encryptedMessage) {
+          ws.send(JSON.stringify({ type: "error", message: "Invalid message payload" }));
+          return;
         }
-      }
 
-      const messageToSend = {
-        type: "message",
-        id: messageId,
-        conversationId: data.conversationId,
-        fromUserId: userId,
-        fromUsername: username,
-        encryptedMessage: data.encryptedMessage,
-        createdAt: now,
-        status: messageStatus,
-      };
+        const isBuddy = await areUsersConfirmedBuddies(userId, data.toUserId);
+        if (!isBuddy) {
+          ws.send(JSON.stringify({ type: "error", message: "Messaging is only allowed between buddies" }));
+          return;
+        }
 
-      if (clients.has(data.toUserId)) {
-        clients.get(data.toUserId).ws.send(JSON.stringify(messageToSend));
+        const participants = await getConversationParticipants(data.conversationId);
+        const isValidConversation =
+          participants.length === 2
+          && participants.includes(userId)
+          && participants.includes(data.toUserId);
 
-        ws.send(
-          JSON.stringify({
-            type: "message_delivered",
-            messageId,
-            conversationId: data.conversationId,
-            deliveredAt,
-          }),
-        );
+        if (!isValidConversation) {
+          ws.send(JSON.stringify({ type: "error", message: "Invalid conversation for this buddy" }));
+          return;
+        }
 
-        const unreadCount = await getUnreadCount(data.toUserId, data.conversationId);
-        clients.get(data.toUserId).ws.send(
-          JSON.stringify({
-            type: "unread_count_update",
-            conversationId: data.conversationId,
-            fromUserId: userId,
-            count: unreadCount,
-          }),
-        );
-      } else {
-        ws.send(JSON.stringify(messageToSend));
+        const messageId = uuidv4();
+        const now = getCurrentTimestamp();
+
+        const { error } = await supabase.from("messages").insert({
+          id: messageId,
+          conversation_id: data.conversationId,
+          from_user_id: userId,
+          encrypted_message: JSON.stringify(data.encryptedMessage),
+          created_at: now,
+          status: "sent",
+        });
+
+        if (error) {
+          console.error("Error saving message:", error);
+          return;
+        }
+
+        let messageStatus = "sent";
+        let deliveredAt = null;
+
+        if (clients.has(data.toUserId)) {
+          deliveredAt = getCurrentTimestamp();
+          messageStatus = "delivered";
+
+          const { error: updateError } = await supabase
+            .from("messages")
+            .update({
+              status: "delivered",
+              delivered_at: deliveredAt,
+            })
+            .eq("id", messageId);
+
+          if (updateError) {
+            console.error("Error updating message status:", updateError);
+          }
+        }
+
+        const messageToSend = {
+          type: "message",
+          id: messageId,
+          conversationId: data.conversationId,
+          fromUserId: userId,
+          fromUsername: username,
+          encryptedMessage: data.encryptedMessage,
+          createdAt: now,
+          status: messageStatus,
+        };
+
+        if (clients.has(data.toUserId)) {
+          clients.get(data.toUserId).ws.send(JSON.stringify(messageToSend));
+
+          ws.send(
+            JSON.stringify({
+              type: "message_delivered",
+              messageId,
+              conversationId: data.conversationId,
+              deliveredAt,
+            }),
+          );
+
+          const unreadCount = await getUnreadCount(data.toUserId, data.conversationId);
+          clients.get(data.toUserId).ws.send(
+            JSON.stringify({
+              type: "unread_count_update",
+              conversationId: data.conversationId,
+              fromUserId: userId,
+              count: unreadCount,
+            }),
+          );
+        } else {
+          ws.send(JSON.stringify(messageToSend));
+        }
+      } catch (error) {
+        console.error("Error handling websocket message event:", error);
+        ws.send(JSON.stringify({ type: "error", message: "Failed to send message" }));
       }
     }
 
     if (data.type === "message_seen") {
-      const conversationId = data.conversationId;
-      const messageIds = data.messageIds || [];
-      const now = getCurrentTimestamp();
+      try {
+        const conversationId = data.conversationId;
+        const messageIds = data.messageIds || [];
+        const now = getCurrentTimestamp();
 
-      if (messageIds.length === 0) {
-        const { error: updateError } = await supabase
-          .from("messages")
-          .update({
-            status: "seen",
-            seen_at: now,
-          })
-          .eq("conversation_id", conversationId)
-          .neq("from_user_id", userId)
-          .neq("status", "seen");
-
-        if (updateError) {
-          console.error("Error updating message seen status:", updateError);
+        if (!conversationId) {
+          ws.send(JSON.stringify({ type: "error", message: "Missing conversationId" }));
           return;
         }
-      } else {
-        const { error: updateError } = await supabase
-          .from("messages")
-          .update({
-            status: "seen",
-            seen_at: now,
-          })
-          .in("id", messageIds)
-          .neq("from_user_id", userId);
 
-        if (updateError) {
-          console.error("Error updating message seen status:", updateError);
+        const access = await validateConversationAccess(userId, conversationId);
+        if (!access.allowed) {
+          ws.send(JSON.stringify({ type: "error", message: access.reason }));
           return;
         }
+
+        if (messageIds.length === 0) {
+          const { error: updateError } = await supabase
+            .from("messages")
+            .update({
+              status: "seen",
+              seen_at: now,
+            })
+            .eq("conversation_id", conversationId)
+            .neq("from_user_id", userId)
+            .neq("status", "seen");
+
+          if (updateError) {
+            console.error("Error updating message seen status:", updateError);
+            return;
+          }
+        } else {
+          const { error: updateError } = await supabase
+            .from("messages")
+            .update({
+              status: "seen",
+              seen_at: now,
+            })
+            .in("id", messageIds)
+            .neq("from_user_id", userId);
+
+          if (updateError) {
+            console.error("Error updating message seen status:", updateError);
+            return;
+          }
+        }
+
+        const recipients = [userId];
+        if (access.otherUserId) {
+          recipients.push(access.otherUserId);
+        }
+
+        recipients.forEach((recipientId) => {
+          const recipientClient = clients.get(recipientId);
+          if (recipientClient?.ws?.readyState === 1) {
+            recipientClient.ws.send(
+              JSON.stringify({
+                type: "message_seen",
+                conversationId,
+                userId,
+                seenAt: now,
+                messageIds,
+              }),
+            );
+          }
+        });
+      } catch (error) {
+        console.error("Error handling websocket seen event:", error);
+        ws.send(JSON.stringify({ type: "error", message: "Failed to mark message as seen" }));
       }
-
-      wss.clients.forEach((client) => {
-        if (client.readyState === 1) {
-          client.send(
-            JSON.stringify({
-              type: "message_seen",
-              conversationId,
-              userId,
-              seenAt: now,
-              messageIds,
-            }),
-          );
-        }
-      });
     }
   });
 
@@ -972,16 +1461,8 @@ wss.on("connection", (ws) => {
     clients.delete(userId);
 
     if (userId) {
-      wss.clients.forEach((client) => {
-        if (client.readyState === 1) {
-          client.send(
-            JSON.stringify({
-              type: "user_status",
-              userId,
-              online: false,
-            }),
-          );
-        }
+      notifyBuddyStatus(userId, false).catch((error) => {
+        console.error("Failed to notify buddy status:", error);
       });
     }
   });
