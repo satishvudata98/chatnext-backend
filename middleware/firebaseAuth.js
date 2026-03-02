@@ -22,12 +22,8 @@ export async function verifyFirebaseToken(token) {
 
   try {
     return await firebaseAuth.verifyIdToken(token);
-  } catch (verifyError) {
-    const details =
-      verifyError?.errorInfo?.message ||
-      verifyError?.message ||
-      "Invalid Firebase token";
-    const error = new Error(`Invalid Firebase token: ${details}`);
+  } catch {
+    const error = new Error("Invalid Firebase token");
     error.statusCode = 401;
     throw error;
   }

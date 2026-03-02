@@ -60,19 +60,15 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  // Compatibility endpoints: now backed by Firebase auth only.
+  // Legacy routes retained for compatibility with previous frontend clients.
   if (
     (req.method === "POST" && pathname === "/api/auth/register") ||
     (req.method === "POST" && pathname === "/api/auth/login") ||
     (req.method === "POST" && pathname === "/api/auth/refresh")
   ) {
-    const authContext = await requireAuthContext(req, res);
-    if (!authContext) return;
-
-    return sendJSON(res, 200, {
-      success: true,
-      user: formatUserForClient(authContext.internalUser),
-      message: "Firebase authentication is active for this API.",
+    return sendJSON(res, 410, {
+      success: false,
+      message: "Direct auth endpoints are deprecated. Use Firebase Authentication from the frontend.",
     });
   }
 
@@ -139,9 +135,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-<<<<<<< Updated upstream
-  // GET USERS
-=======
   if (req.method === "POST" && pathname === "/api/user/encrypted-private-key") {
     const authContext = await requireAuthContext(req, res);
     if (!authContext) return;
@@ -299,7 +292,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
->>>>>>> Stashed changes
   if (req.method === "GET" && pathname === "/api/users") {
     const authContext = await requireAuthContext(req, res);
     if (!authContext) return;
@@ -526,17 +518,6 @@ function buildMissingColumnError(columnName) {
   return error;
 }
 
-function isUniqueConstraintError(error, constraintName) {
-  if (!error) return false;
-  if (error.code !== "23505") return false;
-  if (!constraintName) return true;
-  return (
-    error.message?.includes(constraintName) ||
-    error.details?.includes(constraintName) ||
-    error.hint?.includes(constraintName)
-  );
-}
-
 async function getOrCreateInternalUser(decodedToken) {
   const firebaseUid = decodedToken.uid;
   const firebaseEmail = decodedToken.email || null;
@@ -601,16 +582,6 @@ async function getOrCreateInternalUser(decodedToken) {
 
       const { error } = await supabase.from("users").update(updates).eq("id", byEmail.id);
       if (error) {
-        if (isUniqueConstraintError(error, "users_firebase_uid_key")) {
-          const { data: linkedByUid } = await supabase
-            .from("users")
-            .select("*")
-            .eq("firebase_uid", firebaseUid)
-            .maybeSingle();
-          if (linkedByUid) {
-            return linkedByUid;
-          }
-        }
         if (error.message?.includes("firebase_uid")) throw buildMissingColumnError("firebase_uid");
         if (error.message?.includes("auth_provider")) throw buildMissingColumnError("auth_provider");
         if (error.message?.includes("avatar_url")) throw buildMissingColumnError("avatar_url");
@@ -625,92 +596,34 @@ async function getOrCreateInternalUser(decodedToken) {
   }
 
   const usernameSeed = firebaseName || firebaseEmail?.split("@")[0] || `user_${firebaseUid.slice(0, 8)}`;
+  const username = await generateUniqueUsername(usernameSeed);
   const passwordPlaceholderHash = await bcrypt.hash(uuidv4(), 12);
-  const fallbackEmail = firebaseEmail || `${firebaseUid}@firebase.local`;
 
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    const username =
-      attempt === 0
-        ? await generateUniqueUsername(usernameSeed)
-        : await generateUniqueUsername(`${usernameSeed}${attempt}`);
+  const { data: newUser, error: insertError } = await supabase
+    .from("users")
+    .insert({
+      id: uuidv4(),
+      username,
+      email: firebaseEmail || `${firebaseUid}@firebase.local`,
+      password: passwordPlaceholderHash,
+      firebase_uid: firebaseUid,
+      auth_provider: "firebase",
+      avatar_url: firebasePicture,
+      created_at: now,
+      updated_at: now,
+      last_seen: now,
+    })
+    .select("*")
+    .single();
 
-    const { data: newUser, error: insertError } = await supabase
-      .from("users")
-      .insert({
-        id: uuidv4(),
-        username,
-        email: fallbackEmail,
-        password: passwordPlaceholderHash,
-        firebase_uid: firebaseUid,
-        auth_provider: "firebase",
-        avatar_url: firebasePicture,
-        created_at: now,
-        updated_at: now,
-        last_seen: now,
-      })
-      .select("*")
-      .single();
-
-    if (!insertError) {
-      return newUser;
-    }
-
+  if (insertError) {
     if (insertError.message?.includes("firebase_uid")) throw buildMissingColumnError("firebase_uid");
     if (insertError.message?.includes("auth_provider")) throw buildMissingColumnError("auth_provider");
     if (insertError.message?.includes("avatar_url")) throw buildMissingColumnError("avatar_url");
-
-    // Concurrent request already created/linked this Firebase identity.
-    if (isUniqueConstraintError(insertError, "users_firebase_uid_key")) {
-      const { data: existingByUid } = await supabase
-        .from("users")
-        .select("*")
-        .eq("firebase_uid", firebaseUid)
-        .maybeSingle();
-      if (existingByUid) {
-        return existingByUid;
-      }
-    }
-
-    // Existing account already uses the same email; link and reuse it.
-    if (firebaseEmail && isUniqueConstraintError(insertError, "users_email_key")) {
-      const { data: existingByEmail } = await supabase
-        .from("users")
-        .select("*")
-        .eq("email", firebaseEmail)
-        .maybeSingle();
-
-      if (existingByEmail) {
-        const { error: linkError } = await supabase
-          .from("users")
-          .update({
-            firebase_uid: existingByEmail.firebase_uid || firebaseUid,
-            auth_provider: "firebase",
-            avatar_url: firebasePicture || existingByEmail.avatar_url || null,
-            last_seen: now,
-            updated_at: now,
-          })
-          .eq("id", existingByEmail.id);
-
-        if (!linkError || isUniqueConstraintError(linkError, "users_firebase_uid_key")) {
-          const { data: linkedUser } = await supabase
-            .from("users")
-            .select("*")
-            .eq("id", existingByEmail.id)
-            .single();
-          return linkedUser;
-        }
-      }
-    }
-
-    // Username collision race; retry with a new candidate.
-    if (isUniqueConstraintError(insertError, "users_username_key")) {
-      continue;
-    }
-
     throw new Error(insertError.message);
   }
 
-  throw new Error("Failed to create user profile after multiple retries");
+  return newUser;
 }
 
 async function getUnreadCount(userId, conversationId) {
