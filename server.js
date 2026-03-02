@@ -1,32 +1,28 @@
 import dotenv from "dotenv";
 dotenv.config();
+
 import http from "node:http";
-import fs from "node:fs";
+import url from "node:url";
 import { WebSocketServer } from "ws";
 import bcrypt from "bcrypt";
-import jwt from "jsonwebtoken";
 import { v4 as uuidv4 } from "uuid";
-import url from "node:url";
 import supabase from "./supabaseClient.js";
+import {
+  authenticateRequest,
+  verifyFirebaseToken,
+} from "./middleware/firebaseAuth.js";
 
 const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET;
-const REFRESH_SECRET = process.env.REFRESH_SECRET || JWT_SECRET; // Use different secret if available
-const ACCESS_EXPIRY = "15m"; // Short-lived access token
-const REFRESH_EXPIRY = "7d"; // Long-lived refresh token
-
 const clients = new Map();
 
-
-process.on("uncaughtException", err => {
+process.on("uncaughtException", (err) => {
   console.error("UNCAUGHT EXCEPTION:", err);
 });
 
-process.on("unhandledRejection", err => {
+process.on("unhandledRejection", (err) => {
   console.error("UNHANDLED REJECTION:", err);
 });
 
-// HTTP SERVER
 const server = http.createServer(async (req, res) => {
   const origin = req.headers.origin;
 
@@ -35,10 +31,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.setHeader(
-    "Access-Control-Allow-Methods",
-    "GET, POST, PUT, DELETE, OPTIONS",
-  );
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
   res.setHeader("Access-Control-Allow-Credentials", "true");
 
   if (req.method === "OPTIONS") {
@@ -46,6 +39,7 @@ const server = http.createServer(async (req, res) => {
     res.end();
     return;
   }
+
   const protocol = req.headers["x-forwarded-proto"] || "http";
   const host = req.headers.host || "localhost";
 
@@ -59,7 +53,6 @@ const server = http.createServer(async (req, res) => {
 
   const pathname = parsedUrl.pathname;
 
-  // Healthcheck route (required for Railway)
   if (req.method === "GET" && pathname === "/") {
     return sendJSON(res, 200, {
       success: true,
@@ -67,232 +60,43 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  // REGISTER
-  if (req.method === "POST" && pathname === "/api/auth/register") {
-    let body = "";
-    req.on("data", (chunk) => (body += chunk));
+  // Compatibility endpoints: now backed by Firebase auth only.
+  if (
+    (req.method === "POST" && pathname === "/api/auth/register") ||
+    (req.method === "POST" && pathname === "/api/auth/login") ||
+    (req.method === "POST" && pathname === "/api/auth/refresh")
+  ) {
+    const authContext = await requireAuthContext(req, res);
+    if (!authContext) return;
 
-    req.on("end", async () => {
-      try {
-        const { username, email, password } = JSON.parse(body);
-
-        if (!username || !email || !password)
-          return sendJSON(res, 400, {
-            success: false,
-            message: "Missing fields",
-          });
-
-        const hash = await bcrypt.hash(password, 12);
-        const now = getCurrentTimestamp();
-        const userId = uuidv4();
-
-        const { error } = await supabase.from("users").insert({
-          id: userId,
-          username,
-          email,
-          password: hash,
-          created_at: now,
-          updated_at: now,
-        });
-
-        if (error)
-          return sendJSON(res, 400, { success: false, message: error.message });
-
-        const accessToken = generateAccessToken(userId, username);
-        const refreshToken = generateRefreshToken(userId);
-
-        // Store refresh token in database
-        const refreshExpiry = Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60; // 7 days
-        const { error: refreshError } = await supabase.from("refresh_tokens").insert({
-          user_id: userId,
-          token: refreshToken,
-          expires_at: refreshExpiry,
-          created_at: now,
-        });
-
-        if (refreshError) {
-          console.error("Error storing refresh token:", refreshError);
-          // Continue anyway, as access token is still valid
-        }
-
-        sendJSON(res, 201, {
-          success: true,
-          accessToken,
-          refreshToken,
-          user: { id: userId, username, email },
-        });
-      } catch (err) {
-        sendJSON(res, 500, { success: false, message: err.message });
-      }
+    return sendJSON(res, 200, {
+      success: true,
+      user: formatUserForClient(authContext.internalUser),
+      message: "Firebase authentication is active for this API.",
     });
-
-    return;
   }
 
-  // LOGIN
-  if (req.method === "POST" && pathname === "/api/auth/login") {
-    let body = "";
-    req.on("data", (chunk) => (body += chunk));
-
-    req.on("end", async () => {
-      let data;
-      try {
-        data = JSON.parse(body);
-      } catch {
-        return sendJSON(res, 400, { success: false, message: "Invalid JSON" });
-      }
-
-      const { username, password } = data;
-
-      const { data: user, error } = await supabase
-        .from("users")
-        .select("*")
-        .eq("username", username)
-        .single();
-
-      if (error || !user)
-        return sendJSON(res, 401, {
-          success: false,
-          message: "Invalid credentials",
-        });
-
-      const valid = await bcrypt.compare(password, user.password);
-
-      if (!valid) return sendJSON(res, 401, { success: false });
-
-      await supabase
-        .from("users")
-        .update({ last_seen: getCurrentTimestamp() })
-        .eq("id", user.id);
-
-      const accessToken = generateAccessToken(user.id, user.username);
-      const refreshToken = generateRefreshToken(user.id);
-
-      // Delete old refresh tokens for this user
-      await supabase.from("refresh_tokens").delete().eq("user_id", user.id);
-
-      // Store new refresh token
-      const refreshExpiry = Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60;
-      const { error: refreshError } = await supabase.from("refresh_tokens").insert({
-        user_id: user.id,
-        token: refreshToken,
-        expires_at: refreshExpiry,
-        created_at: getCurrentTimestamp(),
-      });
-
-      if (refreshError) {
-        console.error("Error storing refresh token:", refreshError);
-      }
-
-      sendJSON(res, 200, {
-        success: true,
-        accessToken,
-        refreshToken,
-        user,
-      });
-    });
-
-    return;
-  }
-
-  // REFRESH TOKEN
-  if (req.method === "POST" && pathname === "/api/auth/refresh") {
-    let body = "";
-    req.on("data", (chunk) => (body += chunk));
-
-    req.on("end", async () => {
-      try {
-        const { refreshToken } = JSON.parse(body);
-
-        if (!refreshToken) {
-          return sendJSON(res, 400, { success: false, message: "Refresh token required" });
-        }
-
-        const decoded = verifyRefreshToken(refreshToken);
-        if (!decoded) {
-          return sendJSON(res, 401, { success: false, message: "Invalid refresh token" });
-        }
-
-        // Check if refresh token exists in DB and not expired
-        const { data: tokenData, error } = await supabase
-          .from("refresh_tokens")
-          .select("*")
-          .eq("token", refreshToken)
-          .eq("user_id", decoded.userId)
-          .single();
-
-        if (error || !tokenData || tokenData.expires_at < getCurrentTimestamp()) {
-          return sendJSON(res, 401, { success: false, message: "Refresh token expired or invalid" });
-        }
-
-        // Get user data
-        const { data: user, error: userError } = await supabase
-          .from("users")
-          .select("id, username, email")
-          .eq("id", decoded.userId)
-          .single();
-
-        if (userError || !user) {
-          return sendJSON(res, 401, { success: false, message: "User not found" });
-        }
-
-        // Generate new tokens
-        const newAccessToken = generateAccessToken(user.id, user.username);
-        const newRefreshToken = generateRefreshToken(user.id);
-
-        // Delete old refresh token and store new one
-        await supabase.from("refresh_tokens").delete().eq("token", refreshToken);
-        const refreshExpiry = Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60;
-        await supabase.from("refresh_tokens").insert({
-          user_id: user.id,
-          token: newRefreshToken,
-          expires_at: refreshExpiry,
-          created_at: getCurrentTimestamp(),
-        });
-
-        sendJSON(res, 200, {
-          success: true,
-          accessToken: newAccessToken,
-          refreshToken: newRefreshToken,
-        });
-      } catch (err) {
-        sendJSON(res, 500, { success: false, message: err.message });
-      }
-    });
-
-    return;
-  }
-
-  // VERIFY TOKEN
   if (req.method === "GET" && pathname === "/api/auth/verify") {
-    const token = req.headers.authorization?.split(" ")[1];
-    const decoded = verifyAccessToken(token);
+    const authContext = await requireAuthContext(req, res);
+    if (!authContext) return;
 
-    if (!decoded) {
-      return sendJSON(res, 401, { success: false, message: "Invalid token" });
-    }
-
-    // Get user data
-    const { data: user, error } = await supabase
-      .from("users")
-      .select("id, username, email")
-      .eq("id", decoded.userId)
-      .single();
-
-    if (error || !user) {
-      return sendJSON(res, 401, { success: false, message: "User not found" });
-    }
-
-    sendJSON(res, 200, { success: true, user });
+    const { firebaseUser, internalUser } = authContext;
+    sendJSON(res, 200, {
+      success: true,
+      user: formatUserForClient(internalUser),
+      firebaseUser: {
+        uid: firebaseUser.uid,
+        email: firebaseUser.email || null,
+        name: firebaseUser.name || null,
+        picture: firebaseUser.picture || null,
+      },
+    });
     return;
   }
 
-  // UPDATE PUBLIC KEY
   if (req.method === "POST" && pathname === "/api/user/public-key") {
-    const token = req.headers.authorization?.split(" ")[1];
-    const decoded = verifyAccessToken(token);
-
-    if (!decoded) return sendJSON(res, 401, { success: false });
+    const authContext = await requireAuthContext(req, res);
+    if (!authContext) return;
 
     let body = "";
     req.on("data", (chunk) => (body += chunk));
@@ -304,7 +108,7 @@ const server = http.createServer(async (req, res) => {
         const { error } = await supabase
           .from("users")
           .update({ public_key: publicKey })
-          .eq("id", decoded.userId);
+          .eq("id", authContext.internalUser.id);
 
         if (error) return sendJSON(res, 500, { success: false, message: error.message });
 
@@ -317,12 +121,9 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // GET USER PUBLIC KEY
   if (req.method === "GET" && pathname === "/api/user/public-key") {
-    const token = req.headers.authorization?.split(" ")[1];
-    const decoded = verifyAccessToken(token);
-
-    if (!decoded) return sendJSON(res, 401, { success: false });
+    const authContext = await requireAuthContext(req, res);
+    if (!authContext) return;
 
     const userId = parsedUrl.searchParams.get("userId");
 
@@ -338,17 +139,175 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+<<<<<<< Updated upstream
   // GET USERS
-  if (req.method === "GET" && pathname === "/api/users") {
-    const token = req.headers.authorization?.split(" ")[1];
-    const decoded = verifyToken(token);
+=======
+  if (req.method === "POST" && pathname === "/api/user/encrypted-private-key") {
+    const authContext = await requireAuthContext(req, res);
+    if (!authContext) return;
 
-    if (!decoded) return sendJSON(res, 401, { success: false });
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
+
+    req.on("end", async () => {
+      try {
+        const { encryptedKey, salt, iv } = JSON.parse(body);
+
+        if (!encryptedKey || !salt || !iv) {
+          return sendJSON(res, 400, { success: false, message: "Missing encrypted key data" });
+        }
+
+        const { error } = await supabase
+          .from("users")
+          .update({
+            encrypted_private_key: encryptedKey,
+            private_key_salt: salt,
+            private_key_iv: iv,
+          })
+          .eq("id", authContext.internalUser.id);
+
+        if (error) {
+          console.error("Error storing encrypted private key:", error);
+          return sendJSON(res, 500, { success: false, message: "Failed to store encrypted key" });
+        }
+
+        sendJSON(res, 200, { success: true, message: "Encrypted private key stored" });
+      } catch (e) {
+        console.error("Error:", e);
+        sendJSON(res, 400, { success: false, message: "Invalid request" });
+      }
+    });
+    return;
+  }
+
+  if (req.method === "GET" && pathname === "/api/user/encrypted-private-key") {
+    const authContext = await requireAuthContext(req, res);
+    if (!authContext) return;
+
+    const { data: user, error } = await supabase
+      .from("users")
+      .select("encrypted_private_key, private_key_salt, private_key_iv, public_key")
+      .eq("id", authContext.internalUser.id)
+      .single();
+
+    if (error || !user) {
+      return sendJSON(res, 404, { success: false, message: "User not found" });
+    }
+
+    if (!user.encrypted_private_key) {
+      return sendJSON(res, 404, { success: false, message: "No encrypted private key found" });
+    }
+
+    sendJSON(res, 200, {
+      success: true,
+      encryptedKey: user.encrypted_private_key,
+      salt: user.private_key_salt,
+      iv: user.private_key_iv,
+      publicKey: user.public_key,
+    });
+    return;
+  }
+
+  if (req.method === "POST" && pathname === "/api/user/conversation-keys") {
+    const authContext = await requireAuthContext(req, res);
+    if (!authContext) return;
+
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
+    req.on("end", async () => {
+      try {
+        const { conversationId, encryptedKey, salt, iv } = JSON.parse(body);
+
+        if (!conversationId || !encryptedKey || !salt || !iv) {
+          return sendJSON(res, 400, { success: false, message: "Missing conversation key data" });
+        }
+
+        const { data: user } = await supabase
+          .from("users")
+          .select("conversation_keys")
+          .eq("id", authContext.internalUser.id)
+          .single();
+
+        let conversationKeys = {};
+        if (user && user.conversation_keys) {
+          try {
+            conversationKeys = JSON.parse(user.conversation_keys);
+          } catch {
+            conversationKeys = {};
+          }
+        }
+
+        conversationKeys[conversationId] = {
+          encryptedKey,
+          salt,
+          iv,
+          storedAt: getCurrentTimestamp(),
+        };
+
+        const { error } = await supabase
+          .from("users")
+          .update({
+            conversation_keys: JSON.stringify(conversationKeys),
+          })
+          .eq("id", authContext.internalUser.id);
+
+        if (error) {
+          console.error("Error storing conversation key:", error);
+          return sendJSON(res, 500, { success: false, message: "Failed to store conversation key" });
+        }
+
+        sendJSON(res, 200, { success: true, message: "Conversation key stored" });
+      } catch (e) {
+        console.error("Error:", e);
+        sendJSON(res, 400, { success: false, message: "Invalid request" });
+      }
+    });
+    return;
+  }
+
+  if (req.method === "GET" && pathname === "/api/user/conversation-keys") {
+    const authContext = await requireAuthContext(req, res);
+    if (!authContext) return;
+
+    const { data: user, error } = await supabase
+      .from("users")
+      .select("conversation_keys")
+      .eq("id", authContext.internalUser.id)
+      .single();
+
+    if (error || !user) {
+      return sendJSON(res, 404, { success: false, message: "User not found" });
+    }
+
+    let conversationKeys = {};
+    if (user.conversation_keys) {
+      try {
+        conversationKeys = JSON.parse(user.conversation_keys);
+      } catch (e) {
+        console.error("Error parsing conversation keys:", e);
+      }
+    }
+
+    sendJSON(res, 200, {
+      success: true,
+      conversationKeys,
+    });
+    return;
+  }
+
+>>>>>>> Stashed changes
+  if (req.method === "GET" && pathname === "/api/users") {
+    const authContext = await requireAuthContext(req, res);
+    if (!authContext) return;
 
     const { data, error } = await supabase
       .from("users")
       .select("id, username, email, last_seen, public_key")
-      .neq("id", decoded.userId)
+      .neq("id", authContext.internalUser.id)
       .order("username");
 
     if (error) return sendJSON(res, 500, error);
@@ -359,40 +318,35 @@ const server = http.createServer(async (req, res) => {
     }));
 
     sendJSON(res, 200, { success: true, users });
-
     return;
   }
 
-  // GET OR CREATE CONVERSATION
   if (req.method === "GET" && pathname === "/api/conversations") {
-    const token = req.headers.authorization?.split(" ")[1];
-    const decoded = verifyToken(token);
-
-    if (!decoded) return sendJSON(res, 401, { success: false });
+    const authContext = await requireAuthContext(req, res);
+    if (!authContext) return;
 
     const otherUserId = parsedUrl.searchParams.get("userId");
 
-    if (!otherUserId)
+    if (!otherUserId) {
       return sendJSON(res, 400, {
         success: false,
         message: "Missing userId parameter",
       });
+    }
 
-    // Check if conversation exists between these two users using conversation_members
     const { data: existingConversations, error: searchError } = await supabase
       .from("conversation_members")
       .select("conversation_id")
-      .eq("user_id", decoded.userId);
+      .eq("user_id", authContext.internalUser.id);
 
-    if (searchError)
+    if (searchError) {
       return sendJSON(res, 500, {
         success: false,
         message: searchError.message,
       });
+    }
 
-    // Check which of those conversations contains the other user
     let conversationId = null;
-
     if (existingConversations && existingConversations.length > 0) {
       for (const conv of existingConversations) {
         const { data: memberCheck } = await supabase
@@ -409,7 +363,6 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    // If conversation exists, return it
     if (conversationId) {
       return sendJSON(res, 200, {
         success: true,
@@ -417,57 +370,49 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    // Create new conversation
     conversationId = uuidv4();
     const now = getCurrentTimestamp();
 
-    const { error: insertConvError } = await supabase
-      .from("conversations")
-      .insert({
-        id: conversationId,
-        created_at: now,
-        updated_at: now,
-      });
+    const { error: insertConvError } = await supabase.from("conversations").insert({
+      id: conversationId,
+      created_at: now,
+      updated_at: now,
+    });
 
-    if (insertConvError)
+    if (insertConvError) {
       return sendJSON(res, 500, {
         success: false,
         message: insertConvError.message,
       });
+    }
 
-    // Add both users to conversation_members
-    const { error: insertMembersError } = await supabase
-      .from("conversation_members")
-      .insert([
-        {
-          conversation_id: conversationId,
-          user_id: decoded.userId,
-          joined_at: now,
-        },
-        {
-          conversation_id: conversationId,
-          user_id: otherUserId,
-          joined_at: now,
-        },
-      ]);
+    const { error: insertMembersError } = await supabase.from("conversation_members").insert([
+      {
+        conversation_id: conversationId,
+        user_id: authContext.internalUser.id,
+        joined_at: now,
+      },
+      {
+        conversation_id: conversationId,
+        user_id: otherUserId,
+        joined_at: now,
+      },
+    ]);
 
-    if (insertMembersError)
+    if (insertMembersError) {
       return sendJSON(res, 500, {
         success: false,
         message: insertMembersError.message,
       });
+    }
 
     sendJSON(res, 201, { success: true, conversation: { id: conversationId } });
-
     return;
   }
 
-  // GET MESSAGES
   if (req.method === "GET" && pathname === "/api/messages") {
-    const token = req.headers.authorization?.split(" ")[1];
-    const decoded = verifyToken(token);
-
-    if (!decoded) return sendJSON(res, 401, { success: false });
+    const authContext = await requireAuthContext(req, res);
+    if (!authContext) return;
 
     const conversationId = parsedUrl.searchParams.get("conversationId");
 
@@ -475,13 +420,13 @@ const server = http.createServer(async (req, res) => {
       .from("messages")
       .select(
         `
-                id,
-                conversation_id,
-                from_user_id,
-                encrypted_message,
-                created_at,
-                users(username)
-            `,
+          id,
+          conversation_id,
+          from_user_id,
+          encrypted_message,
+          created_at,
+          users(username)
+        `,
       )
       .eq("conversation_id", conversationId)
       .order("created_at");
@@ -489,286 +434,493 @@ const server = http.createServer(async (req, res) => {
     if (error) return sendJSON(res, 500, error);
 
     sendJSON(res, 200, { success: true, messages: data });
-
     return;
   }
+
+  sendJSON(res, 404, { success: false, message: "Not found" });
 });
 
-// Utility functions
 function sendJSON(res, statusCode, obj) {
-
   res.writeHead(statusCode, {
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
   });
-
   res.end(JSON.stringify(obj));
 }
 
 function getCurrentTimestamp() {
-    return Math.floor(Date.now() / 1000);
+  return Math.floor(Date.now() / 1000);
 }
 
-// Get unread count for a user in a conversation (where they are the receiver and message is not seen)
-async function getUnreadCount(userId, conversationId) {
-    // Query messages where 'from_user_id' is NOT the userId (they are the receiver)
-    // and status is not 'seen'
-    const { count, error } = await supabase
-        .from("messages")
-        .select("*", { count: "exact", head: true })
-        .eq("conversation_id", conversationId)
-        .neq("from_user_id", userId)
-        .neq("status", "seen");
-    
+function isNoRowsError(error) {
+  return error?.code === "PGRST116";
+}
+
+function formatUserForClient(user) {
+  return {
+    id: user.id,
+    username: user.username,
+    email: user.email,
+    avatar_url: user.avatar_url || null,
+  };
+}
+
+async function requireAuthContext(req, res) {
+  try {
+    const firebaseUser = await authenticateRequest(req);
+    const internalUser = await getOrCreateInternalUser(firebaseUser);
+    req.user = internalUser;
+    return { firebaseUser, internalUser };
+  } catch (error) {
+    const statusCode = error.statusCode || 500;
+    const message = error.message || "Authentication failed";
+    sendJSON(res, statusCode, { success: false, message });
+    return null;
+  }
+}
+
+function sanitizeUsername(rawValue) {
+  const normalized = (rawValue || "user")
+    .toLowerCase()
+    .replace(/[^a-z0-9_]/g, "")
+    .slice(0, 24);
+
+  if (!normalized) return "user";
+  if (normalized.length < 3) return `${normalized}user`.slice(0, 24);
+  return normalized;
+}
+
+async function isUsernameTaken(username) {
+  const { data, error } = await supabase
+    .from("users")
+    .select("id")
+    .eq("username", username)
+    .maybeSingle();
+
+  if (error && !isNoRowsError(error)) {
+    throw new Error(`Failed to validate username: ${error.message}`);
+  }
+
+  return Boolean(data);
+}
+
+async function generateUniqueUsername(rawValue) {
+  const base = sanitizeUsername(rawValue);
+  let candidate = base;
+  let suffix = 0;
+
+  while (await isUsernameTaken(candidate)) {
+    suffix += 1;
+    const suffixText = String(suffix);
+    const maxBaseLength = Math.max(3, 24 - suffixText.length);
+    candidate = `${base.slice(0, maxBaseLength)}${suffixText}`;
+  }
+
+  return candidate;
+}
+
+function buildMissingColumnError(columnName) {
+  const error = new Error(
+    `Database column '${columnName}' is missing. Run the Firebase auth migration SQL before using this build.`,
+  );
+  error.statusCode = 500;
+  return error;
+}
+
+function isUniqueConstraintError(error, constraintName) {
+  if (!error) return false;
+  if (error.code !== "23505") return false;
+  if (!constraintName) return true;
+  return (
+    error.message?.includes(constraintName) ||
+    error.details?.includes(constraintName) ||
+    error.hint?.includes(constraintName)
+  );
+}
+
+async function getOrCreateInternalUser(decodedToken) {
+  const firebaseUid = decodedToken.uid;
+  const firebaseEmail = decodedToken.email || null;
+  const firebaseName = decodedToken.name || null;
+  const firebasePicture = decodedToken.picture || null;
+  const now = getCurrentTimestamp();
+
+  const { data: byFirebaseUid, error: byFirebaseUidError } = await supabase
+    .from("users")
+    .select("*")
+    .eq("firebase_uid", firebaseUid)
+    .maybeSingle();
+
+  if (byFirebaseUidError && !isNoRowsError(byFirebaseUidError)) {
+    if (byFirebaseUidError.message?.includes("firebase_uid")) {
+      throw buildMissingColumnError("firebase_uid");
+    }
+    throw new Error(byFirebaseUidError.message);
+  }
+
+  if (byFirebaseUid) {
+    const updates = {
+      last_seen: now,
+      updated_at: now,
+      auth_provider: "firebase",
+      avatar_url: firebasePicture || byFirebaseUid.avatar_url || null,
+      email: byFirebaseUid.email || firebaseEmail,
+    };
+
+    const { error } = await supabase.from("users").update(updates).eq("id", byFirebaseUid.id);
     if (error) {
-        console.error("Error getting unread count:", error);
-        return 0;
+      if (error.message?.includes("auth_provider")) throw buildMissingColumnError("auth_provider");
+      if (error.message?.includes("avatar_url")) throw buildMissingColumnError("avatar_url");
+      throw new Error(error.message);
     }
-    return count || 0;
-}
 
-// JWT
-function generateAccessToken(userId, username) {
-    return jwt.sign({ userId, username, type: 'access' }, JWT_SECRET, {
-        expiresIn: ACCESS_EXPIRY
-    });
-}
+    return {
+      ...byFirebaseUid,
+      ...updates,
+    };
+  }
 
-function generateRefreshToken(userId) {
-    return jwt.sign({ userId, type: 'refresh', jti: uuidv4() }, REFRESH_SECRET, {
-        expiresIn: REFRESH_EXPIRY
-    });
-}
+  if (firebaseEmail) {
+    const { data: byEmail, error: byEmailError } = await supabase
+      .from("users")
+      .select("*")
+      .eq("email", firebaseEmail)
+      .maybeSingle();
 
-function verifyAccessToken(token) {
-    try {
-        const decoded = jwt.verify(token, JWT_SECRET);
-        if (decoded.type !== 'access') return null;
-        return decoded;
-    } catch {
-        return null;
+    if (byEmailError && !isNoRowsError(byEmailError)) {
+      throw new Error(byEmailError.message);
     }
-}
 
-function verifyRefreshToken(token) {
-    try {
-        const decoded = jwt.verify(token, REFRESH_SECRET);
-        if (decoded.type !== 'refresh') return null;
-        return decoded;
-    } catch {
-        return null;
+    if (byEmail) {
+      const updates = {
+        firebase_uid: firebaseUid,
+        auth_provider: "firebase",
+        avatar_url: firebasePicture || byEmail.avatar_url || null,
+        last_seen: now,
+        updated_at: now,
+      };
+
+      const { error } = await supabase.from("users").update(updates).eq("id", byEmail.id);
+      if (error) {
+        if (isUniqueConstraintError(error, "users_firebase_uid_key")) {
+          const { data: linkedByUid } = await supabase
+            .from("users")
+            .select("*")
+            .eq("firebase_uid", firebaseUid)
+            .maybeSingle();
+          if (linkedByUid) {
+            return linkedByUid;
+          }
+        }
+        if (error.message?.includes("firebase_uid")) throw buildMissingColumnError("firebase_uid");
+        if (error.message?.includes("auth_provider")) throw buildMissingColumnError("auth_provider");
+        if (error.message?.includes("avatar_url")) throw buildMissingColumnError("avatar_url");
+        throw new Error(error.message);
+      }
+
+      return {
+        ...byEmail,
+        ...updates,
+      };
     }
+  }
+
+  const usernameSeed = firebaseName || firebaseEmail?.split("@")[0] || `user_${firebaseUid.slice(0, 8)}`;
+  const passwordPlaceholderHash = await bcrypt.hash(uuidv4(), 12);
+  const fallbackEmail = firebaseEmail || `${firebaseUid}@firebase.local`;
+
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const username =
+      attempt === 0
+        ? await generateUniqueUsername(usernameSeed)
+        : await generateUniqueUsername(`${usernameSeed}${attempt}`);
+
+    const { data: newUser, error: insertError } = await supabase
+      .from("users")
+      .insert({
+        id: uuidv4(),
+        username,
+        email: fallbackEmail,
+        password: passwordPlaceholderHash,
+        firebase_uid: firebaseUid,
+        auth_provider: "firebase",
+        avatar_url: firebasePicture,
+        created_at: now,
+        updated_at: now,
+        last_seen: now,
+      })
+      .select("*")
+      .single();
+
+    if (!insertError) {
+      return newUser;
+    }
+
+    if (insertError.message?.includes("firebase_uid")) throw buildMissingColumnError("firebase_uid");
+    if (insertError.message?.includes("auth_provider")) throw buildMissingColumnError("auth_provider");
+    if (insertError.message?.includes("avatar_url")) throw buildMissingColumnError("avatar_url");
+
+    // Concurrent request already created/linked this Firebase identity.
+    if (isUniqueConstraintError(insertError, "users_firebase_uid_key")) {
+      const { data: existingByUid } = await supabase
+        .from("users")
+        .select("*")
+        .eq("firebase_uid", firebaseUid)
+        .maybeSingle();
+      if (existingByUid) {
+        return existingByUid;
+      }
+    }
+
+    // Existing account already uses the same email; link and reuse it.
+    if (firebaseEmail && isUniqueConstraintError(insertError, "users_email_key")) {
+      const { data: existingByEmail } = await supabase
+        .from("users")
+        .select("*")
+        .eq("email", firebaseEmail)
+        .maybeSingle();
+
+      if (existingByEmail) {
+        const { error: linkError } = await supabase
+          .from("users")
+          .update({
+            firebase_uid: existingByEmail.firebase_uid || firebaseUid,
+            auth_provider: "firebase",
+            avatar_url: firebasePicture || existingByEmail.avatar_url || null,
+            last_seen: now,
+            updated_at: now,
+          })
+          .eq("id", existingByEmail.id);
+
+        if (!linkError || isUniqueConstraintError(linkError, "users_firebase_uid_key")) {
+          const { data: linkedUser } = await supabase
+            .from("users")
+            .select("*")
+            .eq("id", existingByEmail.id)
+            .single();
+          return linkedUser;
+        }
+      }
+    }
+
+    // Username collision race; retry with a new candidate.
+    if (isUniqueConstraintError(insertError, "users_username_key")) {
+      continue;
+    }
+
+    throw new Error(insertError.message);
+  }
+
+  throw new Error("Failed to create user profile after multiple retries");
 }
 
-// For backward compatibility, keep generateToken as access token
-function generateToken(userId, username) {
-    return generateAccessToken(userId, username);
+async function getUnreadCount(userId, conversationId) {
+  const { count, error } = await supabase
+    .from("messages")
+    .select("*", { count: "exact", head: true })
+    .eq("conversation_id", conversationId)
+    .neq("from_user_id", userId)
+    .neq("status", "seen");
+
+  if (error) {
+    console.error("Error getting unread count:", error);
+    return 0;
+  }
+  return count || 0;
 }
 
-function verifyToken(token) {
-    return verifyAccessToken(token);
-}
-
-
-// WEBSOCKET
 const wss = new WebSocketServer({ server });
 
-wss.on("connection", ws => {
+wss.on("connection", (ws) => {
+  let userId;
+  let username;
 
-    let userId;
-    let username;
+  ws.on("message", async (msg) => {
+    const data = JSON.parse(msg);
 
-    ws.on("message", async msg => {
+    if (data.type === "connect") {
+      try {
+        const firebaseUser = await verifyFirebaseToken(data.token);
+        const internalUser = await getOrCreateInternalUser(firebaseUser);
 
-        const data = JSON.parse(msg);
+        userId = internalUser.id;
+        username = internalUser.username;
 
-        if (data.type === "connect") {
+        clients.set(userId, { ws, username });
 
-            const decoded = verifyToken(data.token);
+        ws.send(
+          JSON.stringify({
+            type: "connected",
+            userId,
+          }),
+        );
 
-            if (!decoded) return ws.close();
+        wss.clients.forEach((client) => {
+          if (client.readyState === 1) {
+            client.send(
+              JSON.stringify({
+                type: "user_status",
+                userId,
+                online: true,
+              }),
+            );
+          }
+        });
+      } catch {
+        ws.close();
+      }
 
-            userId = decoded.userId;
-            username = decoded.username;
+      return;
+    }
 
-            clients.set(userId, { ws, username });
+    if (!userId || !username) {
+      ws.send(JSON.stringify({ type: "error", message: "Unauthorized websocket client" }));
+      return;
+    }
 
-            ws.send(JSON.stringify({
-                type: "connected",
-                userId
-            }));
+    if (data.type === "message") {
+      const messageId = uuidv4();
+      const now = getCurrentTimestamp();
 
-            // Broadcast to all other clients that this user is now online
-            wss.clients.forEach(client => {
-                if (client.readyState === 1) { // 1 = OPEN
-                    client.send(JSON.stringify({
-                        type: "user_status",
-                        userId: userId,
-                        online: true
-                    }));
-                }
-            });
+      const { error } = await supabase.from("messages").insert({
+        id: messageId,
+        conversation_id: data.conversationId,
+        from_user_id: userId,
+        encrypted_message: JSON.stringify(data.encryptedMessage),
+        created_at: now,
+        status: "sent",
+      });
 
-            return;
+      if (error) {
+        console.error("Error saving message:", error);
+        return;
+      }
+
+      let messageStatus = "sent";
+      let deliveredAt = null;
+
+      if (clients.has(data.toUserId)) {
+        deliveredAt = getCurrentTimestamp();
+        messageStatus = "delivered";
+
+        const { error: updateError } = await supabase
+          .from("messages")
+          .update({
+            status: "delivered",
+            delivered_at: deliveredAt,
+          })
+          .eq("id", messageId);
+
+        if (updateError) {
+          console.error("Error updating message status:", updateError);
         }
+      }
 
-        if (data.type === "message") {
+      const messageToSend = {
+        type: "message",
+        id: messageId,
+        conversationId: data.conversationId,
+        fromUserId: userId,
+        fromUsername: username,
+        encryptedMessage: data.encryptedMessage,
+        createdAt: now,
+        status: messageStatus,
+      };
 
-            const messageId = uuidv4();
-            const now = getCurrentTimestamp();
+      if (clients.has(data.toUserId)) {
+        clients.get(data.toUserId).ws.send(JSON.stringify(messageToSend));
 
-            // Insert message with encrypted content
-            const { error } = await supabase
-                .from("messages")
-                .insert({
-                    id: messageId,
-                    conversation_id: data.conversationId,
-                    from_user_id: userId,
-                    encrypted_message: JSON.stringify(data.encryptedMessage), // Store encrypted data as JSON
-                    created_at: now,
-                    status: "sent"
-                });
+        ws.send(
+          JSON.stringify({
+            type: "message_delivered",
+            messageId,
+            conversationId: data.conversationId,
+            deliveredAt,
+          }),
+        );
 
-            if (error) {
-                console.error("Error saving message:", error);
-                return;
-            }
+        const unreadCount = await getUnreadCount(data.toUserId, data.conversationId);
+        clients.get(data.toUserId).ws.send(
+          JSON.stringify({
+            type: "unread_count_update",
+            conversationId: data.conversationId,
+            fromUserId: userId,
+            count: unreadCount,
+          }),
+        );
+      } else {
+        ws.send(JSON.stringify(messageToSend));
+      }
+    }
 
-            let messageStatus = "sent";
-            let deliveredAt = null;
+    if (data.type === "message_seen") {
+      const conversationId = data.conversationId;
+      const messageIds = data.messageIds || [];
+      const now = getCurrentTimestamp();
 
-            // Check if recipient is online
-            if (clients.has(data.toUserId)) {
-                // Recipient is online, immediately mark as delivered
-                deliveredAt = getCurrentTimestamp();
-                messageStatus = "delivered";
+      if (messageIds.length === 0) {
+        const { error: updateError } = await supabase
+          .from("messages")
+          .update({
+            status: "seen",
+            seen_at: now,
+          })
+          .eq("conversation_id", conversationId)
+          .neq("from_user_id", userId)
+          .neq("status", "seen");
 
-                // Update message status in database
-                const { error: updateError } = await supabase
-                    .from("messages")
-                    .update({
-                        status: "delivered",
-                        delivered_at: deliveredAt
-                    })
-                    .eq("id", messageId);
-
-                if (updateError) {
-                    console.error("Error updating message status:", updateError);
-                }
-            }
-
-            // Prepare message object to broadcast
-            const messageToSend = {
-                type: "message",
-                id: messageId,
-                conversationId: data.conversationId,
-                fromUserId: userId,
-                fromUsername: username,
-                encryptedMessage: data.encryptedMessage, // Send encrypted data
-                createdAt: now,
-                status: messageStatus
-            };
-
-            // Send to recipient if they're online
-            if (clients.has(data.toUserId)) {
-                clients.get(data.toUserId).ws.send(JSON.stringify(messageToSend));
-
-                // Send delivery confirmation to sender
-                ws.send(JSON.stringify({
-                    type: "message_delivered",
-                    messageId: messageId,
-                    conversationId: data.conversationId,
-                    deliveredAt: deliveredAt
-                }));
-
-                // Send unread count update to recipient
-                const unreadCount = await getUnreadCount(data.toUserId, data.conversationId);
-                clients.get(data.toUserId).ws.send(JSON.stringify({
-                    type: "unread_count_update",
-                    conversationId: data.conversationId,
-                    fromUserId: userId,
-                    count: unreadCount
-                }));
-            } else {
-                // Recipient is offline, just send confirmation back to sender
-                ws.send(JSON.stringify(messageToSend));
-            }
-
+        if (updateError) {
+          console.error("Error updating message seen status:", updateError);
+          return;
         }
+      } else {
+        const { error: updateError } = await supabase
+          .from("messages")
+          .update({
+            status: "seen",
+            seen_at: now,
+          })
+          .in("id", messageIds)
+          .neq("from_user_id", userId);
 
-        if (data.type === "message_seen") {
-            // Handle message seen event - batch update all messages as seen
-            const conversationId = data.conversationId;
-            const messageIds = data.messageIds || [];
-            const now = getCurrentTimestamp();
-
-            if (messageIds.length === 0) {
-                // No specific messages, update all unseen messages in this conversation
-                const { error: updateError } = await supabase
-                    .from("messages")
-                    .update({
-                        status: "seen",
-                        seen_at: now
-                    })
-                    .eq("conversation_id", conversationId)
-                    .neq("from_user_id", userId)
-                    .neq("status", "seen");
-
-                if (updateError) {
-                    console.error("Error updating message seen status:", updateError);
-                    return;
-                }
-            } else {
-                // Update specific messages
-                const { error: updateError } = await supabase
-                    .from("messages")
-                    .update({
-                        status: "seen",
-                        seen_at: now
-                    })
-                    .in("id", messageIds)
-                    .neq("from_user_id", userId);
-
-                if (updateError) {
-                    console.error("Error updating message seen status:", updateError);
-                    return;
-                }
-            }
-
-            // Notify all connected clients about seen status for this conversation
-            wss.clients.forEach(client => {
-                if (client.readyState === 1) { // 1 = OPEN
-                    client.send(JSON.stringify({
-                        type: "message_seen",
-                        conversationId: conversationId,
-                        userId: userId,
-                        seenAt: now,
-                        messageIds: messageIds
-                    }));
-                }
-            });
+        if (updateError) {
+          console.error("Error updating message seen status:", updateError);
+          return;
         }
+      }
 
-    });
-
-    ws.on("close", () => {
-
-        clients.delete(userId);
-
-        // Broadcast to all clients that this user is now offline
-        if (userId) {
-            wss.clients.forEach(client => {
-                if (client.readyState === 1) { // 1 = OPEN
-                    client.send(JSON.stringify({
-                        type: "user_status",
-                        userId: userId,
-                        online: false
-                    }));
-                }
-            });
+      wss.clients.forEach((client) => {
+        if (client.readyState === 1) {
+          client.send(
+            JSON.stringify({
+              type: "message_seen",
+              conversationId,
+              userId,
+              seenAt: now,
+              messageIds,
+            }),
+          );
         }
+      });
+    }
+  });
 
-    });
+  ws.on("close", () => {
+    clients.delete(userId);
 
+    if (userId) {
+      wss.clients.forEach((client) => {
+        if (client.readyState === 1) {
+          client.send(
+            JSON.stringify({
+              type: "user_status",
+              userId,
+              online: false,
+            }),
+          );
+        }
+      });
+    }
+  });
 });
 
 server.listen(PORT, "0.0.0.0", () => {
