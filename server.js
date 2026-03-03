@@ -453,7 +453,7 @@ const server = http.createServer(async (req, res) => {
 
     const { data, error } = await supabase
       .from("users")
-      .select("id, username, email, last_seen, public_key")
+      .select("id, username, email, last_seen, public_key, avatar_url")
       .in("id", buddyIds)
       .order("username");
 
