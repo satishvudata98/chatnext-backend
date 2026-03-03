@@ -871,6 +871,9 @@ const server = http.createServer(async (req, res) => {
           from_user_id,
           encrypted_message,
           created_at,
+          status,
+          delivered_at,
+          seen_at,
           users(username)
         `,
       )
@@ -1022,7 +1025,7 @@ async function validateConversationAccess(userId, conversationId) {
   return { allowed: true, otherUserId };
 }
 
-async function notifyBuddyStatus(userId, online) {
+async function notifyBuddyStatus(userId, online, lastSeen = null) {
   const buddyIds = await getConfirmedBuddyIds(userId);
   for (const buddyId of buddyIds) {
     const buddyClient = clients.get(buddyId);
@@ -1032,9 +1035,24 @@ async function notifyBuddyStatus(userId, online) {
           type: "user_status",
           userId,
           online,
+          lastSeen,
         }),
       );
     }
+  }
+}
+
+async function updateUserLastSeen(userId, timestamp) {
+  const { error } = await supabase
+    .from("users")
+    .update({
+      last_seen: timestamp,
+      updated_at: timestamp,
+    })
+    .eq("id", userId);
+
+  if (error) {
+    console.error("Failed to update last_seen:", error);
   }
 }
 
@@ -1268,7 +1286,7 @@ wss.on("connection", (ws) => {
           }),
         );
 
-        await notifyBuddyStatus(userId, true);
+        await notifyBuddyStatus(userId, true, internalUser.last_seen || null);
       } catch {
         ws.close();
       }
@@ -1386,7 +1404,8 @@ wss.on("connection", (ws) => {
     if (data.type === "message_seen") {
       try {
         const conversationId = data.conversationId;
-        const messageIds = data.messageIds || [];
+        const incomingMessageIds = Array.isArray(data.messageIds) ? data.messageIds : [];
+        const sanitizedMessageIds = [...new Set(incomingMessageIds.filter((id) => typeof id === "string"))];
         const now = getCurrentTimestamp();
 
         if (!conversationId) {
@@ -1400,35 +1419,39 @@ wss.on("connection", (ws) => {
           return;
         }
 
-        if (messageIds.length === 0) {
-          const { error: updateError } = await supabase
-            .from("messages")
-            .update({
-              status: "seen",
-              seen_at: now,
-            })
-            .eq("conversation_id", conversationId)
-            .neq("from_user_id", userId)
-            .neq("status", "seen");
+        if (sanitizedMessageIds.length === 0) {
+          return;
+        }
 
-          if (updateError) {
-            console.error("Error updating message seen status:", updateError);
-            return;
-          }
-        } else {
-          const { error: updateError } = await supabase
-            .from("messages")
-            .update({
-              status: "seen",
-              seen_at: now,
-            })
-            .in("id", messageIds)
-            .neq("from_user_id", userId);
+        const { data: unseenMessages, error: unseenMessagesError } = await supabase
+          .from("messages")
+          .select("id")
+          .eq("conversation_id", conversationId)
+          .in("id", sanitizedMessageIds)
+          .neq("from_user_id", userId)
+          .neq("status", "seen");
 
-          if (updateError) {
-            console.error("Error updating message seen status:", updateError);
-            return;
-          }
+        if (unseenMessagesError) {
+          console.error("Error loading unseen messages:", unseenMessagesError);
+          return;
+        }
+
+        const seenMessageIds = (unseenMessages || []).map((message) => message.id);
+        if (seenMessageIds.length === 0) {
+          return;
+        }
+
+        const { error: updateError } = await supabase
+          .from("messages")
+          .update({
+            status: "seen",
+            seen_at: now,
+          })
+          .in("id", seenMessageIds);
+
+        if (updateError) {
+          console.error("Error updating message seen status:", updateError);
+          return;
         }
 
         const recipients = [userId];
@@ -1445,11 +1468,23 @@ wss.on("connection", (ws) => {
                 conversationId,
                 userId,
                 seenAt: now,
-                messageIds,
+                messageIds: seenMessageIds,
               }),
             );
           }
         });
+
+        const unreadCount = await getUnreadCount(userId, conversationId);
+        if (ws.readyState === 1) {
+          ws.send(
+            JSON.stringify({
+              type: "unread_count_update",
+              conversationId,
+              fromUserId: access.otherUserId || null,
+              count: unreadCount,
+            }),
+          );
+        }
       } catch (error) {
         console.error("Error handling websocket seen event:", error);
         ws.send(JSON.stringify({ type: "error", message: "Failed to mark message as seen" }));
@@ -1457,11 +1492,13 @@ wss.on("connection", (ws) => {
     }
   });
 
-  ws.on("close", () => {
+  ws.on("close", async () => {
     clients.delete(userId);
 
     if (userId) {
-      notifyBuddyStatus(userId, false).catch((error) => {
+      const lastSeen = getCurrentTimestamp();
+      await updateUserLastSeen(userId, lastSeen);
+      notifyBuddyStatus(userId, false, lastSeen).catch((error) => {
         console.error("Failed to notify buddy status:", error);
       });
     }
