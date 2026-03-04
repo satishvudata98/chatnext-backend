@@ -888,6 +888,15 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === "GET" && pathname === "/api/unread-counts") {
+    const authContext = await requireAuthContext(req, res);
+    if (!authContext) return;
+
+    const counts = await getUnreadCountsBySender(authContext.internalUser.id);
+    sendJSON(res, 200, { success: true, counts });
+    return;
+  }
+
   sendJSON(res, 404, { success: false, message: "Not found" });
 });
 
@@ -1252,6 +1261,43 @@ async function getUnreadCount(userId, conversationId) {
     return 0;
   }
   return count || 0;
+}
+
+async function getUnreadCountsBySender(userId) {
+  const { data: membershipRows, error: membershipError } = await supabase
+    .from("conversation_members")
+    .select("conversation_id")
+    .eq("user_id", userId);
+
+  if (membershipError) {
+    console.error("Error loading memberships for unread counts:", membershipError);
+    return {};
+  }
+
+  const conversationIds = [...new Set((membershipRows || []).map((row) => row.conversation_id))];
+  if (conversationIds.length === 0) {
+    return {};
+  }
+
+  const { data: unreadRows, error: unreadError } = await supabase
+    .from("messages")
+    .select("from_user_id")
+    .in("conversation_id", conversationIds)
+    .neq("from_user_id", userId)
+    .neq("status", "seen");
+
+  if (unreadError) {
+    console.error("Error loading unread rows:", unreadError);
+    return {};
+  }
+
+  const counts = {};
+  for (const row of unreadRows || []) {
+    if (!row.from_user_id) continue;
+    counts[row.from_user_id] = (counts[row.from_user_id] || 0) + 1;
+  }
+
+  return counts;
 }
 
 const wss = new WebSocketServer({ server });
