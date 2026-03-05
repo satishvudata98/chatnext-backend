@@ -61,6 +61,12 @@ const server = http.createServer(async (req, res) => {
 
   const pathname = parsedUrl.pathname;
 
+  if (req.method === "GET" && pathname === "/health") {
+    return sendJSON(res, 200, {
+      status: "ok",
+    });
+  }
+
   if (req.method === "GET" && pathname === "/") {
     return sendJSON(res, 200, {
       success: true,
