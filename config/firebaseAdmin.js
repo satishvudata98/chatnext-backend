@@ -1,8 +1,18 @@
-import fs from "node:fs";
-import path from "node:path";
 import admin from "firebase-admin";
 
 function getCredential() {
+  if (
+    process.env.FIREBASE_PROJECT_ID &&
+    process.env.FIREBASE_PRIVATE_KEY &&
+    process.env.FIREBASE_CLIENT_EMAIL
+  ) {
+    return admin.credential.cert({
+      projectId: process.env.FIREBASE_PROJECT_ID,
+      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+      privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
+    });
+  }
+
   const inlineJson = process.env.FIREBASE_SERVICE_ACCOUNT_KEY;
   if (inlineJson) {
     return admin.credential.cert(JSON.parse(inlineJson));
@@ -12,15 +22,6 @@ function getCredential() {
   if (base64Json) {
     const decoded = Buffer.from(base64Json, "base64").toString("utf8");
     return admin.credential.cert(JSON.parse(decoded));
-  }
-
-  const relativePath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
-  if (relativePath) {
-    const absolutePath = path.isAbsolute(relativePath)
-      ? relativePath
-      : path.join(process.cwd(), relativePath);
-    const fileContent = fs.readFileSync(absolutePath, "utf8");
-    return admin.credential.cert(JSON.parse(fileContent));
   }
 
   return admin.credential.applicationDefault();

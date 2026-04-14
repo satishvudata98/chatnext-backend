@@ -367,7 +367,7 @@ const server = http.createServer(async (req, res) => {
           .from(MEDIA_BUCKET)
           .upload(storagePath, encryptedBuffer, {
             upsert: false,
-            contentType: "application/octet-stream",
+            contentType: mimeType || "application/octet-stream",
           });
 
         if (uploadError) {
@@ -472,7 +472,7 @@ const server = http.createServer(async (req, res) => {
 
     const users = (data || []).map((u) => ({
       ...u,
-      online: clients.has(u.id),
+      online: clients.has(u.id) && clients.get(u.id).size > 0,
     }));
 
     sendJSON(res, 200, { success: true, users });
@@ -509,7 +509,7 @@ const server = http.createServer(async (req, res) => {
       .filter((candidate) => !excludedUserIds.has(candidate.id))
       .map((candidate) => ({
         ...candidate,
-        online: clients.has(candidate.id),
+        online: clients.has(candidate.id) && clients.get(candidate.id).size > 0,
       }));
 
     sendJSON(res, 200, { success: true, users });
@@ -638,25 +638,29 @@ const server = http.createServer(async (req, res) => {
           return sendJSON(res, 500, { success: false, message: insertError.message });
         }
 
-        const targetClient = clients.get(toUserId);
-        if (targetClient?.ws?.readyState === 1) {
-          targetClient.ws.send(
-            JSON.stringify({
-              type: "buddy_request_incoming",
-              request: {
-                id: requestId,
-                requester_id: authContext.internalUser.id,
-                receiver_id: toUserId,
-                status: BUDDY_REQUEST_STATUS.PENDING,
-                created_at: now,
-                requester: {
-                  id: authContext.internalUser.id,
-                  username: authContext.internalUser.username,
-                  email: authContext.internalUser.email,
-                },
-              },
-            }),
-          );
+        const targetClients = clients.get(toUserId);
+        if (targetClients && targetClients.size > 0) {
+          targetClients.forEach((wsClient) => {
+            if (wsClient.readyState === 1) {
+              wsClient.send(
+                JSON.stringify({
+                  type: "buddy_request_incoming",
+                  request: {
+                    id: requestId,
+                    requester_id: authContext.internalUser.id,
+                    receiver_id: toUserId,
+                    status: BUDDY_REQUEST_STATUS.PENDING,
+                    created_at: now,
+                    requester: {
+                      id: authContext.internalUser.id,
+                      username: authContext.internalUser.username,
+                      email: authContext.internalUser.email,
+                    },
+                  },
+                }),
+              );
+            }
+          });
         }
 
         sendJSON(res, 201, { success: true });
@@ -721,21 +725,25 @@ const server = http.createServer(async (req, res) => {
           return sendJSON(res, 500, { success: false, message: updateError.message });
         }
 
-        const requesterClient = clients.get(request.requester_id);
-        if (requesterClient?.ws?.readyState === 1) {
-          requesterClient.ws.send(
-            JSON.stringify({
-              type: "buddy_request_updated",
-              requestId: request.id,
-              status: nextStatus,
-              fromUserId: authContext.internalUser.id,
-            }),
-          );
+        const requesterClients = clients.get(request.requester_id);
+        if (requesterClients && requesterClients.size > 0) {
+          requesterClients.forEach((wsClient) => {
+            if (wsClient.readyState === 1) {
+              wsClient.send(
+                JSON.stringify({
+                  type: "buddy_request_updated",
+                  requestId: request.id,
+                  status: nextStatus,
+                  fromUserId: authContext.internalUser.id,
+                }),
+              );
+            }
+          });
         }
 
         if (action === "accept") {
           await notifyBuddyStatus(authContext.internalUser.id, true);
-          await notifyBuddyStatus(request.requester_id, Boolean(clients.has(request.requester_id)));
+          await notifyBuddyStatus(request.requester_id, clients.has(request.requester_id) && clients.get(request.requester_id).size > 0);
         }
 
         sendJSON(res, 200, { success: true, status: nextStatus });
@@ -1043,16 +1051,20 @@ async function validateConversationAccess(userId, conversationId) {
 async function notifyBuddyStatus(userId, online, lastSeen = null) {
   const buddyIds = await getConfirmedBuddyIds(userId);
   for (const buddyId of buddyIds) {
-    const buddyClient = clients.get(buddyId);
-    if (buddyClient?.ws?.readyState === 1) {
-      buddyClient.ws.send(
-        JSON.stringify({
-          type: "user_status",
-          userId,
-          online,
-          lastSeen,
-        }),
-      );
+    const buddyClients = clients.get(buddyId);
+    if (buddyClients && buddyClients.size > 0) {
+      buddyClients.forEach((wsClient) => {
+        if (wsClient.readyState === 1) {
+          wsClient.send(
+            JSON.stringify({
+              type: "user_status",
+              userId,
+              online,
+              lastSeen,
+            }),
+          );
+        }
+      });
     }
   }
 }
@@ -1308,9 +1320,23 @@ async function getUnreadCountsBySender(userId) {
 
 const wss = new WebSocketServer({ server });
 
+const heartbeatInterval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) return ws.terminate();
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, 30000);
+
+wss.on('close', () => {
+  clearInterval(heartbeatInterval);
+});
+
 wss.on("connection", (ws) => {
   let userId;
   let username;
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
 
   ws.on("message", async (msg) => {
     let data;
@@ -1329,7 +1355,10 @@ wss.on("connection", (ws) => {
         userId = internalUser.id;
         username = internalUser.username;
 
-        clients.set(userId, { ws, username });
+        if (!clients.has(userId)) {
+          clients.set(userId, new Set());
+        }
+        clients.get(userId).add(ws);
 
         ws.send(
           JSON.stringify({
@@ -1357,6 +1386,8 @@ wss.on("connection", (ws) => {
           ws.send(JSON.stringify({ type: "error", message: "Invalid message payload" }));
           return;
         }
+
+        const clientMessageId = data.clientMessageId;
 
         const isBuddy = await areUsersConfirmedBuddies(userId, data.toUserId);
         if (!isBuddy) {
@@ -1395,7 +1426,10 @@ wss.on("connection", (ws) => {
         let messageStatus = "sent";
         let deliveredAt = null;
 
-        if (clients.has(data.toUserId)) {
+        const recipientSockets = clients.get(data.toUserId);
+        const hasRecipient = recipientSockets && recipientSockets.size > 0;
+
+        if (hasRecipient) {
           deliveredAt = getCurrentTimestamp();
           messageStatus = "delivered";
 
@@ -1415,6 +1449,7 @@ wss.on("connection", (ws) => {
         const messageToSend = {
           type: "message",
           id: messageId,
+          clientMessageId,
           conversationId: data.conversationId,
           fromUserId: userId,
           fromUsername: username,
@@ -1423,29 +1458,51 @@ wss.on("connection", (ws) => {
           status: messageStatus,
         };
 
-        if (clients.has(data.toUserId)) {
-          clients.get(data.toUserId).ws.send(JSON.stringify(messageToSend));
+        const senderSockets = clients.get(userId);
+        if (senderSockets && senderSockets.size > 0) {
+          senderSockets.forEach((s) => {
+            if (s.readyState === 1) {
+              s.send(JSON.stringify(messageToSend));
+            }
+          });
+        }
 
-          ws.send(
-            JSON.stringify({
-              type: "message_delivered",
-              messageId,
-              conversationId: data.conversationId,
-              deliveredAt,
-            }),
-          );
+        if (hasRecipient) {
+          recipientSockets.forEach((recipientWs) => {
+            if (recipientWs.readyState === 1) {
+              recipientWs.send(JSON.stringify(messageToSend));
+            }
+          });
+
+          if (senderSockets && senderSockets.size > 0) {
+            senderSockets.forEach((s) => {
+              if (s.readyState === 1) {
+                s.send(
+                  JSON.stringify({
+                    type: "message_delivered",
+                    messageId,
+                    clientMessageId,
+                    conversationId: data.conversationId,
+                    deliveredAt,
+                  }),
+                );
+              }
+            });
+          }
 
           const unreadCount = await getUnreadCount(data.toUserId, data.conversationId);
-          clients.get(data.toUserId).ws.send(
-            JSON.stringify({
-              type: "unread_count_update",
-              conversationId: data.conversationId,
-              fromUserId: userId,
-              count: unreadCount,
-            }),
-          );
-        } else {
-          ws.send(JSON.stringify(messageToSend));
+          recipientSockets.forEach((recipientWs) => {
+            if (recipientWs.readyState === 1) {
+              recipientWs.send(
+                JSON.stringify({
+                  type: "unread_count_update",
+                  conversationId: data.conversationId,
+                  fromUserId: userId,
+                  count: unreadCount,
+                }),
+              );
+            }
+          });
         }
       } catch (error) {
         console.error("Error handling websocket message event:", error);
@@ -1512,17 +1569,21 @@ wss.on("connection", (ws) => {
         }
 
         recipients.forEach((recipientId) => {
-          const recipientClient = clients.get(recipientId);
-          if (recipientClient?.ws?.readyState === 1) {
-            recipientClient.ws.send(
-              JSON.stringify({
-                type: "message_seen",
-                conversationId,
-                userId,
-                seenAt: now,
-                messageIds: seenMessageIds,
-              }),
-            );
+          const recipientSockets = clients.get(recipientId);
+          if (recipientSockets && recipientSockets.size > 0) {
+            recipientSockets.forEach((recipientWs) => {
+              if (recipientWs.readyState === 1) {
+                recipientWs.send(
+                  JSON.stringify({
+                    type: "message_seen",
+                    conversationId,
+                    userId,
+                    seenAt: now,
+                    messageIds: seenMessageIds,
+                  }),
+                );
+              }
+            });
           }
         });
 
@@ -1545,14 +1606,19 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", async () => {
-    clients.delete(userId);
-
     if (userId) {
-      const lastSeen = getCurrentTimestamp();
-      await updateUserLastSeen(userId, lastSeen);
-      notifyBuddyStatus(userId, false, lastSeen).catch((error) => {
-        console.error("Failed to notify buddy status:", error);
-      });
+      const userSockets = clients.get(userId);
+      if (userSockets) {
+        userSockets.delete(ws);
+        if (userSockets.size === 0) {
+          clients.delete(userId);
+          const lastSeen = getCurrentTimestamp();
+          await updateUserLastSeen(userId, lastSeen);
+          notifyBuddyStatus(userId, false, lastSeen).catch((error) => {
+            console.error("Failed to notify buddy status:", error);
+          });
+        }
+      }
     }
   });
 });
