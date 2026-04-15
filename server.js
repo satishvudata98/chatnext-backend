@@ -17,6 +17,11 @@ const clients = new Map();
 const MEDIA_BUCKET = process.env.SUPABASE_MEDIA_BUCKET || "chat-media";
 const MAX_MEDIA_SIZE_BYTES = 10 * 1024 * 1024;
 const ALLOWED_MEDIA_TYPES = new Set(["image/jpeg", "image/jpg", "image/png"]);
+const MESSAGE_CONTENT_TYPES = {
+  TEXT: "text",
+  IMAGE: "image",
+};
+const MESSAGE_EDIT_WINDOW_SECONDS = 15 * 60;
 const BUDDY_REQUEST_STATUS = {
   PENDING: "PENDING",
   ACCEPTED: "ACCEPTED",
@@ -883,8 +888,12 @@ const server = http.createServer(async (req, res) => {
           id,
           conversation_id,
           from_user_id,
+          content_type,
+          reply_to_message_id,
           encrypted_message,
           created_at,
+          edited_at,
+          edit_version,
           status,
           delivered_at,
           seen_at,
@@ -923,6 +932,68 @@ function sendJSON(res, statusCode, obj) {
 
 function getCurrentTimestamp() {
   return Math.floor(Date.now() / 1000);
+}
+
+function isSupportedMessageContentType(contentType) {
+  return Object.values(MESSAGE_CONTENT_TYPES).includes(contentType);
+}
+
+function isEditWindowExpired(createdAt, currentTimestamp) {
+  if (typeof createdAt !== "number") {
+    return true;
+  }
+
+  return currentTimestamp - createdAt > MESSAGE_EDIT_WINDOW_SECONDS;
+}
+
+function sendToSockets(socketSet, payload) {
+  if (!socketSet || socketSet.size === 0) return;
+
+  const serialized = JSON.stringify(payload);
+  socketSet.forEach((socket) => {
+    if (socket.readyState === 1) {
+      socket.send(serialized);
+    }
+  });
+}
+
+function sendToUsers(userIds, payload) {
+  const uniqueUserIds = [...new Set((userIds || []).filter(Boolean))];
+  uniqueUserIds.forEach((recipientUserId) => {
+    sendToSockets(clients.get(recipientUserId), payload);
+  });
+}
+
+async function getMessageRecord(messageId) {
+  const { data, error } = await supabase
+    .from("messages")
+    .select("id, conversation_id, from_user_id, content_type, reply_to_message_id, created_at, edit_version")
+    .eq("id", messageId)
+    .maybeSingle();
+
+  if (error && !isNoRowsError(error)) {
+    console.error("Failed to load message record:", error);
+    return null;
+  }
+
+  return data || null;
+}
+
+async function validateReplyTarget(conversationId, replyToMessageId) {
+  if (!replyToMessageId) {
+    return { valid: true, message: null };
+  }
+
+  const replyTarget = await getMessageRecord(replyToMessageId);
+  if (!replyTarget) {
+    return { valid: false, reason: "Reply target message not found" };
+  }
+
+  if (replyTarget.conversation_id !== conversationId) {
+    return { valid: false, reason: "Reply target must be in the same conversation" };
+  }
+
+  return { valid: true, message: replyTarget };
 }
 
 async function isUserConversationMember(userId, conversationId) {
@@ -1388,6 +1459,10 @@ wss.on("connection", (ws) => {
         }
 
         const clientMessageId = data.clientMessageId;
+        const replyToMessageId = typeof data.replyToMessageId === "string" ? data.replyToMessageId : null;
+        const contentType = isSupportedMessageContentType(data.contentType)
+          ? data.contentType
+          : MESSAGE_CONTENT_TYPES.TEXT;
 
         const isBuddy = await areUsersConfirmedBuddies(userId, data.toUserId);
         if (!isBuddy) {
@@ -1406,6 +1481,12 @@ wss.on("connection", (ws) => {
           return;
         }
 
+        const replyValidation = await validateReplyTarget(data.conversationId, replyToMessageId);
+        if (!replyValidation.valid) {
+          ws.send(JSON.stringify({ type: "error", message: replyValidation.reason }));
+          return;
+        }
+
         const messageId = uuidv4();
         const now = getCurrentTimestamp();
 
@@ -1413,8 +1494,12 @@ wss.on("connection", (ws) => {
           id: messageId,
           conversation_id: data.conversationId,
           from_user_id: userId,
+          content_type: contentType,
+          reply_to_message_id: replyToMessageId,
           encrypted_message: JSON.stringify(data.encryptedMessage),
           created_at: now,
+          edited_at: null,
+          edit_version: 0,
           status: "sent",
         });
 
@@ -1454,7 +1539,11 @@ wss.on("connection", (ws) => {
           fromUserId: userId,
           fromUsername: username,
           encryptedMessage: data.encryptedMessage,
+          contentType,
+          replyToMessageId,
           createdAt: now,
+          editedAt: null,
+          editVersion: 0,
           status: messageStatus,
         };
 
@@ -1507,6 +1596,79 @@ wss.on("connection", (ws) => {
       } catch (error) {
         console.error("Error handling websocket message event:", error);
         ws.send(JSON.stringify({ type: "error", message: "Failed to send message" }));
+      }
+    }
+
+    if (data.type === "message_edit") {
+      try {
+        if (!data?.messageId || !data?.conversationId || !data?.encryptedMessage) {
+          ws.send(JSON.stringify({ type: "error", message: "Invalid edit payload" }));
+          return;
+        }
+
+        if (data.contentType !== MESSAGE_CONTENT_TYPES.TEXT) {
+          ws.send(JSON.stringify({ type: "error", message: "Only text messages can be edited" }));
+          return;
+        }
+
+        const access = await validateConversationAccess(userId, data.conversationId);
+        if (!access.allowed) {
+          ws.send(JSON.stringify({ type: "error", message: access.reason }));
+          return;
+        }
+
+        const existingMessage = await getMessageRecord(data.messageId);
+        if (!existingMessage || existingMessage.conversation_id !== data.conversationId) {
+          ws.send(JSON.stringify({ type: "error", message: "Message not found" }));
+          return;
+        }
+
+        if (existingMessage.from_user_id !== userId) {
+          ws.send(JSON.stringify({ type: "error", message: "Only the sender can edit this message" }));
+          return;
+        }
+
+        if (existingMessage.content_type !== MESSAGE_CONTENT_TYPES.TEXT) {
+          ws.send(JSON.stringify({ type: "error", message: "Only text messages can be edited" }));
+          return;
+        }
+
+        const now = getCurrentTimestamp();
+        if (isEditWindowExpired(existingMessage.created_at, now)) {
+          ws.send(JSON.stringify({ type: "error", message: "Edit window has expired" }));
+          return;
+        }
+
+        const nextEditVersion = Number(existingMessage.edit_version || 0) + 1;
+        const { error: updateError } = await supabase
+          .from("messages")
+          .update({
+            encrypted_message: JSON.stringify(data.encryptedMessage),
+            edited_at: now,
+            edit_version: nextEditVersion,
+          })
+          .eq("id", data.messageId);
+
+        if (updateError) {
+          console.error("Error editing message:", updateError);
+          ws.send(JSON.stringify({ type: "error", message: "Failed to edit message" }));
+          return;
+        }
+
+        const participants = await getConversationParticipants(data.conversationId);
+        sendToUsers(participants, {
+          type: "message_edited",
+          id: data.messageId,
+          conversationId: data.conversationId,
+          encryptedMessage: data.encryptedMessage,
+          contentType: existingMessage.content_type,
+          replyToMessageId: existingMessage.reply_to_message_id,
+          editedAt: now,
+          editVersion: nextEditVersion,
+        });
+      } catch (error) {
+        console.error("Error handling websocket message_edit event:", error);
+        ws.send(JSON.stringify({ type: "error", message: "Failed to edit message" }));
       }
     }
 

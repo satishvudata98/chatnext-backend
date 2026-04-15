@@ -52,9 +52,13 @@ CREATE TABLE IF NOT EXISTS messages (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     conversation_id UUID REFERENCES conversations(id) ON DELETE CASCADE,
     from_user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    content_type TEXT CHECK (content_type IN ('text', 'image')),
+    reply_to_message_id UUID REFERENCES messages(id) ON DELETE SET NULL,
     encrypted_message TEXT NOT NULL,
     status TEXT DEFAULT 'sent',
     created_at BIGINT,
+    edited_at BIGINT,
+    edit_version INTEGER NOT NULL DEFAULT 0,
     delivered_at BIGINT,
     seen_at BIGINT
 );
@@ -78,6 +82,8 @@ CREATE INDEX IF NOT EXISTS idx_conversation_members_conv ON conversation_members
 CREATE INDEX IF NOT EXISTS idx_conversation_members_user ON conversation_members(user_id);
 -- Speed up chat loading
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON messages(conversation_id, created_at);
+-- Speed up reply target lookups
+CREATE INDEX IF NOT EXISTS idx_messages_reply_to_message_id ON messages(reply_to_message_id);
 -- Speed up unread count calculation
 CREATE INDEX IF NOT EXISTS idx_messages_unread ON messages(conversation_id, status) WHERE status != 'seen';
 -- Lookup user by Firebase UID and Email
